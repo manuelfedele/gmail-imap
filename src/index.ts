@@ -16,9 +16,7 @@ const DEFAULT_MAILBOX = "INBOX";
 const DEFAULT_SEARCH_LIMIT = 10;
 const DEFAULT_SINCE_DAYS = 30;
 const BODY_TEXT_LIMIT = 4000;
-const PRE_LIMIT_FETCH_FACTOR = 4;
-const PRE_LIMIT_FETCH_MIN = 50;
-const PRE_LIMIT_FETCH_MAX = 200;
+const FETCH_CANDIDATES_CAP = 1000;
 const SEARCH_FETCH_TIMEOUT_MS = 30_000;
 const IMAP_CONNECT_TIMEOUT_MS = 10_000;
 const IMAP_RETRY_ATTEMPTS = 3;
@@ -644,14 +642,11 @@ function createRuntime(cfg: NormalizedConfig) {
             };
           }
 
-          const sortedUids = [...matchedUids].sort((a, b) => b - a);
-          const preLimit = Math.min(
-            PRE_LIMIT_FETCH_MAX,
-            Math.max(PRE_LIMIT_FETCH_MIN, limit * PRE_LIMIT_FETCH_FACTOR)
-          );
-          const fetchTargets = sortedUids.slice(0, preLimit);
-          const truncatedAt =
-            sortedUids.length > preLimit ? sortedUids[preLimit - 1] : undefined;
+          // Server already filtered by date (SINCE/BEFORE) — fetch all candidates and
+          // sort by internalDate client-side. Cap at FETCH_CANDIDATES_CAP for safety.
+          const capped = matchedUids.length > FETCH_CANDIDATES_CAP;
+          const fetchTargets = capped ? matchedUids.slice(-FETCH_CANDIDATES_CAP) : matchedUids;
+          const truncatedAt = capped ? fetchTargets[0] : undefined;
 
           const fetchQuery: FetchQueryObject = {
             uid: true,
@@ -675,7 +670,6 @@ function createRuntime(cfg: NormalizedConfig) {
                 timedOut = true;
                 break;
               }
-              if (matches.length >= limit) break;
               scanned += 1;
               let bodyText = "";
               let attachmentCount: number | undefined;
@@ -741,11 +735,9 @@ function createRuntime(cfg: NormalizedConfig) {
               pickedOperators: pickedOperators.length ? pickedOperators : undefined,
               effectiveQuery: effective.query,
               partial: timedOut
-                ? {
-                    reason: `fetch loop exceeded ${SEARCH_FETCH_TIMEOUT_MS}ms`,
-                    processed: scanned,
-                    remaining: Math.max(0, fetchTargets.length - scanned),
-                  }
+                ? { reason: `fetch loop exceeded ${SEARCH_FETCH_TIMEOUT_MS}ms`, processed: scanned, remaining: Math.max(0, fetchTargets.length - scanned) }
+                : capped
+                ? { reason: `server returned ${matchedUids.length} matches; fetched most recent ${FETCH_CANDIDATES_CAP}`, processed: fetchTargets.length, remaining: matchedUids.length - fetchTargets.length }
                 : undefined,
             },
           };
