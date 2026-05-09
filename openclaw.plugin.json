@@ -1,8 +1,8 @@
 {
   "id": "gmail",
   "name": "Gmail",
-  "description": "Gmail (and IMAP/SMTP) plugin for OpenClaw using App Passwords. Server-side IMAP search with Gmail X-GM-RAW, multi-term AND, hasAttachment, thread fetch, HTML→text fallback, and attachment download to disk.",
-  "version": "0.2.0",
+  "description": "Gmail (and IMAP/SMTP) plugin for OpenClaw using App Passwords. Server-side IMAP search with Gmail X-GM-RAW, multi-term AND, hasAttachment, thread fetch, HTML\u2192text fallback, and attachment download to disk.",
+  "version": "0.2.1",
   "contracts": {
     "tools": [
       "gmail_mailboxes_list",
@@ -43,18 +43,34 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "host": { "type": "string" },
-          "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-          "secure": { "type": "boolean" }
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "secure": {
+            "type": "boolean"
+          }
         }
       },
       "smtp": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "host": { "type": "string" },
-          "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-          "secure": { "type": "boolean" }
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "secure": {
+            "type": "boolean"
+          }
         }
       },
       "defaultMailbox": {

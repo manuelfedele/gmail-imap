@@ -17,7 +17,8 @@ const DEFAULT_SEARCH_LIMIT = 10;
 const BODY_TEXT_LIMIT = 4000;
 const PRE_LIMIT_FETCH_FACTOR = 4;
 const PRE_LIMIT_FETCH_MIN = 50;
-const PRE_LIMIT_FETCH_MAX = 500;
+const PRE_LIMIT_FETCH_MAX = 200;
+const SEARCH_FETCH_TIMEOUT_MS = 30_000;
 
 interface RawConfig {
   username?: string;
@@ -309,6 +310,59 @@ function isGmailHost(host: string): boolean {
   return /(?:^|\.)gmail\.com$/i.test(host) || /(?:^|\.)googlemail\.com$/i.test(host);
 }
 
+/**
+ * Parse a free-text query into a CNF-like structure: an array of OR groups,
+ * each containing AND terms. `"foo bar"` -> [["foo","bar"]] (1 group, AND).
+ * `"foo OR bar"` -> [["foo"],["bar"]] (2 groups, either matches).
+ * Operator tokens "OR" / "AND" are stripped (case-insensitive).
+ */
+function parseQueryGroups(query: string | undefined): string[][] {
+  if (!query) return [];
+  const cleaned = query.trim();
+  if (!cleaned) return [];
+  const orGroups = cleaned.split(/\s+OR\s+/i);
+  return orGroups
+    .map((g) =>
+      g
+        .split(/\s+/)
+        .filter((t) => t && !/^(?:AND|OR)$/i.test(t))
+    )
+    .filter((g) => g.length > 0);
+}
+
+/** Walk an imapflow bodyStructure and return true if any part looks like an attachment. */
+function bsHasAttachment(bs: any): boolean {
+  if (!bs) return false;
+  const dispo = String(bs.disposition || "").toLowerCase();
+  if (dispo === "attachment") return true;
+  const filename =
+    bs.dispositionParameters?.filename ||
+    bs.dispositionParameters?.name ||
+    bs.parameters?.name ||
+    bs.parameters?.filename;
+  const type = String(bs.type || "").toLowerCase();
+  if (filename && type !== "multipart" && !type.startsWith("text/")) return true;
+  if (Array.isArray(bs.childNodes) && bs.childNodes.some(bsHasAttachment)) return true;
+  if (Array.isArray(bs.parts) && bs.parts.some(bsHasAttachment)) return true;
+  return false;
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
 function clientHasGmailExt(client: ImapFlow): boolean {
   try {
     const caps = (client as any).serverInfo?.capability ?? [];
@@ -341,6 +395,8 @@ interface SearchInfo {
   filteredClientSide: number;
   truncatedAt?: number;
   gmailRawUsed?: boolean;
+  fetchMode?: "envelope" | "bodyStructure" | "source";
+  partial?: { reason: string; processed: number; remaining: number };
 }
 
 interface SearchResultBundle {
@@ -350,7 +406,7 @@ interface SearchResultBundle {
 
 function buildServerCriteria(
   params: SearchParams,
-  primaryQueryTerm: string | undefined,
+  serverBodyTerm: string | undefined,
   client: ImapFlow,
   cfg: NormalizedConfig
 ): { criteria: any; gmailRawUsed: boolean } {
@@ -376,7 +432,7 @@ function buildServerCriteria(
   if (params.unread === false) criteria.seen = true;
   if (params.flagged === true) criteria.flagged = true;
   if (params.flagged === false) criteria.unflagged = true;
-  if (primaryQueryTerm) criteria.body = primaryQueryTerm;
+  if (serverBodyTerm) criteria.body = serverBodyTerm;
   if (typeof params.beforeUid === "number" && params.beforeUid > 0) {
     criteria.uid = `1:${params.beforeUid - 1}`;
   }
@@ -401,17 +457,24 @@ function createRuntime(cfg: NormalizedConfig) {
     async searchMessages(params: SearchParams): Promise<SearchResultBundle> {
       const mailbox = params.mailbox?.trim() || cfg.defaultMailbox;
       const limit = Math.min(params.limit ?? cfg.defaultSearchLimit, 100);
-      const queryTerms = (params.query ?? "")
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean);
-      const primaryTerm = queryTerms[0];
-      const additionalTerms = queryTerms.slice(1);
-      const needsBody = additionalTerms.length > 0 || params.hasAttachment !== undefined;
+      const queryGroups = parseQueryGroups(params.query);
+      // Use server-side BODY only if there's exactly one OR group with one AND term.
+      // Otherwise we'd over-narrow on the server.
+      const serverBodyTerm =
+        queryGroups.length === 1 && queryGroups[0].length === 1 ? queryGroups[0][0] : undefined;
+      const needsClientQueryFilter = queryGroups.length > 0 && !serverBodyTerm;
+      const needsAttachmentFilter = params.hasAttachment !== undefined;
+      // Source is only needed for multi-term/OR query filtering against the body.
+      // For hasAttachment alone, BODYSTRUCTURE is enough and ~100x cheaper.
+      const fetchMode: "envelope" | "bodyStructure" | "source" = needsClientQueryFilter
+        ? "source"
+        : needsAttachmentFilter
+        ? "bodyStructure"
+        : "envelope";
 
       return withImapClient(cfg, (client) =>
         withMailboxLock(client, mailbox, async () => {
-          const { criteria, gmailRawUsed } = buildServerCriteria(params, primaryTerm, client, cfg);
+          const { criteria, gmailRawUsed } = buildServerCriteria(params, serverBodyTerm, client, cfg);
           const matchedRaw = (await client.search(criteria, { uid: true })) || [];
           const matchedUids: number[] = (Array.isArray(matchedRaw) ? matchedRaw : []).map(Number);
           if (!matchedUids.length) {
@@ -423,6 +486,7 @@ function createRuntime(cfg: NormalizedConfig) {
                 scanned: 0,
                 filteredClientSide: 0,
                 gmailRawUsed,
+                fetchMode,
               },
             };
           }
@@ -443,44 +507,69 @@ function createRuntime(cfg: NormalizedConfig) {
             internalDate: true,
             threadId: true,
           } as FetchQueryObject;
-          if (needsBody) fetchQuery.source = true;
+          if (fetchMode === "source") fetchQuery.source = true;
+          if (fetchMode === "bodyStructure") (fetchQuery as any).bodyStructure = true;
 
           const matches: MessageSummary[] = [];
           let scanned = 0;
           let filteredClientSide = 0;
-          for await (const item of client.fetch(fetchTargets.join(","), fetchQuery, { uid: true })) {
-            scanned += 1;
-            let bodyText = "";
-            let attachmentCount: number | undefined;
-            if (needsBody && item.source) {
-              const parsed = await simpleParser(await readSourceText(item.source));
-              const textBody = (parsed.text ?? "").trim();
-              bodyText =
-                textBody ||
-                (typeof parsed.html === "string" ? htmlToText(parsed.html) : "");
-              attachmentCount = (parsed.attachments ?? []).length;
-            }
-            const summary = toSummary(mailbox, item, bodyText, attachmentCount);
-            if (additionalTerms.length) {
-              const haystack = lower(
-                `${summary.subject} ${summary.from} ${summary.to} ${summary.cc} ${bodyText}`
-              );
-              const allMatch = additionalTerms.every((t) => haystack.includes(lower(t)));
-              if (!allMatch) {
+          let timedOut = false;
+          const deadline = Date.now() + SEARCH_FETCH_TIMEOUT_MS;
+
+          try {
+            for await (const item of client.fetch(fetchTargets.join(","), fetchQuery, { uid: true })) {
+              if (Date.now() > deadline) {
+                timedOut = true;
+                break;
+              }
+              if (matches.length >= limit) break;
+              scanned += 1;
+              let bodyText = "";
+              let attachmentCount: number | undefined;
+              if (fetchMode === "source" && item.source) {
+                const parsed = await withTimeout(
+                  simpleParser(await readSourceText(item.source)),
+                  Math.max(1000, deadline - Date.now()),
+                  "simpleParser"
+                );
+                const textBody = (parsed.text ?? "").trim();
+                bodyText = textBody || (typeof parsed.html === "string" ? htmlToText(parsed.html) : "");
+                attachmentCount = (parsed.attachments ?? []).length;
+              } else if (fetchMode === "bodyStructure") {
+                attachmentCount = bsHasAttachment((item as any).bodyStructure) ? 1 : 0;
+              }
+              const summary = toSummary(mailbox, item, bodyText, attachmentCount);
+
+              if (needsClientQueryFilter) {
+                const haystack = lower(
+                  `${summary.subject} ${summary.from} ${summary.to} ${summary.cc} ${bodyText}`
+                );
+                const matchesAnyGroup = queryGroups.some((group) =>
+                  group.every((term) => haystack.includes(lower(term)))
+                );
+                if (!matchesAnyGroup) {
+                  filteredClientSide += 1;
+                  continue;
+                }
+              }
+              if (params.hasAttachment === true && !(attachmentCount && attachmentCount > 0)) {
                 filteredClientSide += 1;
                 continue;
               }
+              if (params.hasAttachment === false && attachmentCount && attachmentCount > 0) {
+                filteredClientSide += 1;
+                continue;
+              }
+              matches.push(summary);
             }
-            if (params.hasAttachment === true && !(attachmentCount && attachmentCount > 0)) {
-              filteredClientSide += 1;
-              continue;
+          } catch (err) {
+            if (err instanceof Error && /timed out/i.test(err.message)) {
+              timedOut = true;
+            } else {
+              throw err;
             }
-            if (params.hasAttachment === false && attachmentCount && attachmentCount > 0) {
-              filteredClientSide += 1;
-              continue;
-            }
-            matches.push(summary);
           }
+
           matches.sort((a, b) => {
             const da = parseDate(a.date ?? undefined)?.valueOf() ?? 0;
             const db = parseDate(b.date ?? undefined)?.valueOf() ?? 0;
@@ -495,6 +584,14 @@ function createRuntime(cfg: NormalizedConfig) {
               filteredClientSide,
               truncatedAt,
               gmailRawUsed,
+              fetchMode,
+              partial: timedOut
+                ? {
+                    reason: `fetch loop exceeded ${SEARCH_FETCH_TIMEOUT_MS}ms`,
+                    processed: scanned,
+                    remaining: Math.max(0, fetchTargets.length - scanned),
+                  }
+                : undefined,
             },
           };
         })
@@ -687,7 +784,7 @@ function formatMessageList(messages: MessageSummary[], info?: SearchInfo): strin
     return "(no messages)";
   }
   const head = info
-    ? `# ${messages.length} of ${info.matchedTotal} server matches (scanned=${info.scanned}, filtered=${info.filteredClientSide}${info.gmailRawUsed ? ", gmailRaw" : ""}${info.truncatedAt ? `, truncatedAtUid=${info.truncatedAt}` : ""})\n\n`
+    ? `# ${messages.length} of ${info.matchedTotal} server matches (mode=${info.fetchMode}, scanned=${info.scanned}, filtered=${info.filteredClientSide}${info.gmailRawUsed ? ", gmailRaw" : ""}${info.truncatedAt ? `, truncatedAtUid=${info.truncatedAt}` : ""}${info.partial ? `, PARTIAL: ${info.partial.reason} (${info.partial.processed}/${info.partial.processed + info.partial.remaining})` : ""})\n\n`
     : "";
   return (
     head +
