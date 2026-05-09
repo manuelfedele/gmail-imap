@@ -159,13 +159,22 @@ Now ask your agent:
 ### Search examples
 
 ```jsonc
-// Find unread emails from accountant in the last 14 days, with attachments only
-{ "from": "accountant@firm.com", "unread": true, "since": "2026-04-25", "hasAttachment": true }
-
 // Multi-term AND: every word must appear somewhere in subject/from/to/cc/body
 { "query": "stripe invoice 2026" }
 
-// Full Gmail search syntax (Gmail accounts only) — same as the search box on gmail.com
+// OR alternation: literal `OR` between terms
+{ "query": "invoice OR fattura OR receipt" }
+
+// Inline Gmail-style operators are auto-extracted (you don't need separate fields).
+// `from:`, `to:`, `subject:` (quoted ok), `has:attachment`, `is:unread`, `is:starred`,
+// `in:LABEL`, `label:LABEL`, `before:`, `after:` / `since:` (YYYY-MM-DD or YYYY/MM/DD).
+{ "query": "from:accountant@firm.com has:attachment is:unread after:2026-04-25" }
+{ "query": "from:stripe.com subject:\"invoice 2026\" is:starred" }
+
+// Explicit params (these win over inline operators if both are set)
+{ "from": "accountant@firm.com", "unread": true, "since": "2026-04-25", "hasAttachment": true }
+
+// Full Gmail search syntax (Gmail accounts only) — bypasses all parsing
 { "gmailRaw": "from:stripe.com subject:invoice has:attachment after:2026/04/01" }
 
 // Pagination: get the next page after the oldest UID you saw last time
@@ -357,6 +366,20 @@ PRs welcome — see [Contributing](#contributing).
 ---
 
 ## Changelog
+
+### 0.3.0
+
+- **Gmail-style operators inside `query` are auto-extracted**: `from:foo@bar`, `to:x`, `subject:"hello world"`, `has:attachment`, `is:unread`, `is:starred`, `in:LABEL` / `label:LABEL`, `before:YYYY-MM-DD`, `after:YYYY-MM-DD` / `since:`. Explicit params still win when both are set. The remaining text is the actual free-text query.
+- Tool result diagnostics now include `info.pickedOperators` and `info.effectiveQuery`, so you can see exactly what was extracted and what was searched.
+- Tool description rewritten to teach the agent the inline-operator syntax up front (most agents reach for it naturally).
+
+### 0.2.1
+
+- Fix: multi-term AND no longer treats literal `OR` / `AND` tokens as required terms. Query is parsed into OR groups of AND terms (`foo OR bar baz` → `[["foo"],["bar","baz"]]`).
+- Fix: `hasAttachment` no longer fetches full message bodies. Uses IMAP `BODYSTRUCTURE` to detect attachments — orders of magnitude cheaper. (Avoids minute-long stalls on common keywords.)
+- 30-second deadline on the search fetch loop. Partial results return with `info.partial = { reason, processed, remaining }`.
+- `info.fetchMode` field added to diagnostics: `envelope` / `bodyStructure` / `source` so you can tell why a search was cheap or expensive.
+- Pre-limit fetch cap lowered from 500 to 200.
 
 ### 0.2.0
 

@@ -311,6 +311,100 @@ function isGmailHost(host: string): boolean {
 }
 
 /**
+ * Strip Gmail-style operators (`from:X`, `subject:"foo bar"`, `has:attachment`,
+ * `is:unread`, `is:starred`, `in:LABEL`, `label:LABEL`, `before:`, `after:`,
+ * `since:`) out of `query` and merge them into the explicit params. Explicit
+ * params win over inline operators. Returns the cleaned remainder text.
+ */
+function extractGmailOperators(
+  query: string
+): {
+  remaining: string;
+  parsed: Pick<
+    SearchParams,
+    "from" | "to" | "subject" | "unread" | "flagged" | "hasAttachment" | "since" | "before" | "mailbox"
+  >;
+  picked: string[];
+} {
+  const parsed: any = {};
+  const picked: string[] = [];
+  const opRe = /(\w+):(?:"([^"]+)"|(\S+))/g;
+  const ranges: Array<[number, number]> = [];
+  let m: RegExpExecArray | null;
+  while ((m = opRe.exec(query)) !== null) {
+    const key = m[1].toLowerCase();
+    const value = m[2] !== undefined ? m[2] : m[3];
+    let consumed = false;
+    switch (key) {
+      case "from":
+        if (parsed.from === undefined) parsed.from = value;
+        consumed = true;
+        break;
+      case "to":
+        if (parsed.to === undefined) parsed.to = value;
+        consumed = true;
+        break;
+      case "subject":
+        if (parsed.subject === undefined) parsed.subject = value;
+        consumed = true;
+        break;
+      case "has":
+        if (/attachment/i.test(value)) {
+          parsed.hasAttachment = true;
+          consumed = true;
+        }
+        break;
+      case "is":
+        if (/^unread$/i.test(value)) {
+          parsed.unread = true;
+          consumed = true;
+        } else if (/^read$/i.test(value)) {
+          parsed.unread = false;
+          consumed = true;
+        } else if (/^(?:flagged|starred)$/i.test(value)) {
+          parsed.flagged = true;
+          consumed = true;
+        }
+        break;
+      case "in":
+      case "label":
+        if (parsed.mailbox === undefined) parsed.mailbox = value;
+        consumed = true;
+        break;
+      case "before":
+        if (parsed.before === undefined) parsed.before = normalizeGmailDate(value);
+        consumed = true;
+        break;
+      case "after":
+      case "since":
+        if (parsed.since === undefined) parsed.since = normalizeGmailDate(value);
+        consumed = true;
+        break;
+    }
+    if (consumed) {
+      ranges.push([m.index, m.index + m[0].length]);
+      picked.push(`${key}:${value}`);
+    }
+  }
+  // Build the remaining text by removing the consumed ranges
+  ranges.sort((a, b) => a[0] - b[0]);
+  let remaining = "";
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (start > cursor) remaining += query.slice(cursor, start);
+    cursor = end;
+  }
+  if (cursor < query.length) remaining += query.slice(cursor);
+  return { remaining: remaining.replace(/\s+/g, " ").trim(), parsed, picked };
+}
+
+function normalizeGmailDate(v: string): string {
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(v)) return v;
+  if (/^\d{4}\/\d{1,2}\/\d{1,2}$/.test(v)) return v.replace(/\//g, "-");
+  return v;
+}
+
+/**
  * Parse a free-text query into a CNF-like structure: an array of OR groups,
  * each containing AND terms. `"foo bar"` -> [["foo","bar"]] (1 group, AND).
  * `"foo OR bar"` -> [["foo"],["bar"]] (2 groups, either matches).
@@ -397,6 +491,8 @@ interface SearchInfo {
   gmailRawUsed?: boolean;
   fetchMode?: "envelope" | "bodyStructure" | "source";
   partial?: { reason: string; processed: number; remaining: number };
+  pickedOperators?: string[];
+  effectiveQuery?: string;
 }
 
 interface SearchResultBundle {
@@ -455,15 +551,38 @@ function createRuntime(cfg: NormalizedConfig) {
     },
 
     async searchMessages(params: SearchParams): Promise<SearchResultBundle> {
-      const mailbox = params.mailbox?.trim() || cfg.defaultMailbox;
-      const limit = Math.min(params.limit ?? cfg.defaultSearchLimit, 100);
-      const queryGroups = parseQueryGroups(params.query);
+      // Pre-parse Gmail-style operators (`from:X subject:Y has:attachment is:unread`)
+      // out of the free-text query and merge into params. Explicit params win.
+      let pickedOperators: string[] = [];
+      let effective: SearchParams = params;
+      if (params.query && !params.gmailRaw) {
+        const { remaining, parsed, picked } = extractGmailOperators(params.query);
+        if (picked.length > 0) {
+          pickedOperators = picked;
+          effective = {
+            ...params,
+            from: params.from ?? parsed.from,
+            to: params.to ?? parsed.to,
+            subject: params.subject ?? parsed.subject,
+            unread: params.unread ?? parsed.unread,
+            flagged: params.flagged ?? parsed.flagged,
+            hasAttachment: params.hasAttachment ?? parsed.hasAttachment,
+            since: params.since ?? parsed.since,
+            before: params.before ?? parsed.before,
+            mailbox: params.mailbox ?? parsed.mailbox,
+            query: remaining || undefined,
+          };
+        }
+      }
+      const mailbox = effective.mailbox?.trim() || cfg.defaultMailbox;
+      const limit = Math.min(effective.limit ?? cfg.defaultSearchLimit, 100);
+      const queryGroups = parseQueryGroups(effective.query);
       // Use server-side BODY only if there's exactly one OR group with one AND term.
       // Otherwise we'd over-narrow on the server.
       const serverBodyTerm =
         queryGroups.length === 1 && queryGroups[0].length === 1 ? queryGroups[0][0] : undefined;
       const needsClientQueryFilter = queryGroups.length > 0 && !serverBodyTerm;
-      const needsAttachmentFilter = params.hasAttachment !== undefined;
+      const needsAttachmentFilter = effective.hasAttachment !== undefined;
       // Source is only needed for multi-term/OR query filtering against the body.
       // For hasAttachment alone, BODYSTRUCTURE is enough and ~100x cheaper.
       const fetchMode: "envelope" | "bodyStructure" | "source" = needsClientQueryFilter
@@ -474,7 +593,7 @@ function createRuntime(cfg: NormalizedConfig) {
 
       return withImapClient(cfg, (client) =>
         withMailboxLock(client, mailbox, async () => {
-          const { criteria, gmailRawUsed } = buildServerCriteria(params, serverBodyTerm, client, cfg);
+          const { criteria, gmailRawUsed } = buildServerCriteria(effective, serverBodyTerm, client, cfg);
           const matchedRaw = (await client.search(criteria, { uid: true })) || [];
           const matchedUids: number[] = (Array.isArray(matchedRaw) ? matchedRaw : []).map(Number);
           if (!matchedUids.length) {
@@ -487,6 +606,8 @@ function createRuntime(cfg: NormalizedConfig) {
                 filteredClientSide: 0,
                 gmailRawUsed,
                 fetchMode,
+                pickedOperators: pickedOperators.length ? pickedOperators : undefined,
+                effectiveQuery: effective.query,
               },
             };
           }
@@ -552,11 +673,11 @@ function createRuntime(cfg: NormalizedConfig) {
                   continue;
                 }
               }
-              if (params.hasAttachment === true && !(attachmentCount && attachmentCount > 0)) {
+              if (effective.hasAttachment === true && !(attachmentCount && attachmentCount > 0)) {
                 filteredClientSide += 1;
                 continue;
               }
-              if (params.hasAttachment === false && attachmentCount && attachmentCount > 0) {
+              if (effective.hasAttachment === false && attachmentCount && attachmentCount > 0) {
                 filteredClientSide += 1;
                 continue;
               }
@@ -585,6 +706,8 @@ function createRuntime(cfg: NormalizedConfig) {
               truncatedAt,
               gmailRawUsed,
               fetchMode,
+              pickedOperators: pickedOperators.length ? pickedOperators : undefined,
+              effectiveQuery: effective.query,
               partial: timedOut
                 ? {
                     reason: `fetch loop exceeded ${SEARCH_FETCH_TIMEOUT_MS}ms`,
@@ -784,7 +907,7 @@ function formatMessageList(messages: MessageSummary[], info?: SearchInfo): strin
     return "(no messages)";
   }
   const head = info
-    ? `# ${messages.length} of ${info.matchedTotal} server matches (mode=${info.fetchMode}, scanned=${info.scanned}, filtered=${info.filteredClientSide}${info.gmailRawUsed ? ", gmailRaw" : ""}${info.truncatedAt ? `, truncatedAtUid=${info.truncatedAt}` : ""}${info.partial ? `, PARTIAL: ${info.partial.reason} (${info.partial.processed}/${info.partial.processed + info.partial.remaining})` : ""})\n\n`
+    ? `# ${messages.length} of ${info.matchedTotal} server matches (mode=${info.fetchMode}, scanned=${info.scanned}, filtered=${info.filteredClientSide}${info.gmailRawUsed ? ", gmailRaw" : ""}${info.pickedOperators?.length ? `, extracted=[${info.pickedOperators.join(" ")}]` : ""}${info.effectiveQuery ? `, q="${info.effectiveQuery}"` : ""}${info.truncatedAt ? `, truncatedAtUid=${info.truncatedAt}` : ""}${info.partial ? `, PARTIAL: ${info.partial.reason} (${info.partial.processed}/${info.partial.processed + info.partial.remaining})` : ""})\n\n`
     : "";
   return (
     head +
@@ -905,7 +1028,7 @@ export default definePluginEntry({
       name: "gmail_messages_search",
       label: "Search messages (server-side)",
       description:
-        "Server-side IMAP search across the entire mailbox. `query` is split on whitespace into AND terms; the first term is sent as IMAP BODY and the rest are matched client-side against subject/from/to/cc/body. Use `gmailRaw` for the full Gmail search syntax (Gmail accounts only). Filters: `from`, `to`, `subject`, `unread`, `flagged`, `hasAttachment`, `since`, `before`, `beforeUid` (cursor for pagination). Default `limit` 10, max 100.",
+        "Server-side IMAP search across the entire mailbox. `query` accepts free text with AND-by-default plus literal `OR` for alternation, e.g. `fattura OR invoice`. Inline Gmail-style operators inside `query` are auto-extracted into the right server-side filters: `from:foo@bar`, `to:x`, `subject:\"hello world\"`, `has:attachment`, `is:unread`, `is:starred`, `in:LABEL` / `label:LABEL`, `before:2026-04-01`, `after:2025-01-01` (`/` or `-` date separators OK). Explicit params win over inline operators. Use `gmailRaw` to bypass parsing entirely and pass a raw Gmail web-search expression (Gmail accounts only). Other params: `from`, `to`, `subject`, `unread`, `flagged`, `hasAttachment`, `since`, `before`, `beforeUid` (cursor for pagination). Default `limit` 10, max 100.",
       parameters: Type.Object({
         mailbox: Type.Optional(Type.String({ minLength: 1 })),
         query: Type.Optional(Type.String({ minLength: 1 })),
