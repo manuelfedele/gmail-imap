@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-gmail-plugin",
+  "name": "@manuelfedele/openclaw-gmail-plugin",
   "version": "0.1.0",
   "description": "OpenClaw plugin for Gmail (and other IMAP/SMTP mailboxes) using App Passwords. Read, search, send, reply, organize, and download attachments.",
   "type": "module",
@@ -37,7 +37,16 @@
   "openclaw": {
     "extensions": [
       "./dist/index.js"
-    ]
+    ],
+    "compat": {
+      "pluginApi": ">=2026.4.0"
+    },
+    "build": {
+      "openclawVersion": "2026.5.7"
+    },
+    "install": {
+      "minHostVersion": ">=2026.4.0"
+    }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.32.0",
