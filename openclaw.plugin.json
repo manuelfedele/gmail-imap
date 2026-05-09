@@ -2,7 +2,7 @@
   "id": "gmail",
   "name": "Gmail",
   "description": "Gmail (and IMAP/SMTP) plugin for OpenClaw using App Passwords. Server-side IMAP search with Gmail X-GM-RAW, multi-term AND, hasAttachment, thread fetch, HTML\u2192text fallback, and attachment download to disk.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "contracts": {
     "tools": [
       "gmail_mailboxes_list",

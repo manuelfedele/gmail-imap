@@ -14,11 +14,15 @@ const DEFAULT_SMTP_HOST = "smtp.gmail.com";
 const DEFAULT_SMTP_PORT = 465;
 const DEFAULT_MAILBOX = "INBOX";
 const DEFAULT_SEARCH_LIMIT = 10;
+const DEFAULT_SINCE_DAYS = 30;
 const BODY_TEXT_LIMIT = 4000;
 const PRE_LIMIT_FETCH_FACTOR = 4;
 const PRE_LIMIT_FETCH_MIN = 50;
 const PRE_LIMIT_FETCH_MAX = 200;
 const SEARCH_FETCH_TIMEOUT_MS = 30_000;
+const IMAP_CONNECT_TIMEOUT_MS = 10_000;
+const IMAP_RETRY_ATTEMPTS = 3;
+const IMAP_RETRY_DELAYS_MS = [100, 500, 2000];
 
 interface RawConfig {
   username?: string;
@@ -258,23 +262,43 @@ async function withImapClient<T>(
   cfg: NormalizedConfig,
   fn: (client: ImapFlow) => Promise<T>
 ): Promise<T> {
-  const client = new ImapFlow({
-    host: cfg.imap.host,
-    port: cfg.imap.port,
-    secure: cfg.imap.secure,
-    auth: { user: cfg.username, pass: cfg.appPassword },
-    logger: false,
-  });
-  await client.connect();
-  try {
-    return await fn(client);
-  } finally {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < IMAP_RETRY_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, IMAP_RETRY_DELAYS_MS[attempt - 1]));
+    }
+    const client = new ImapFlow({
+      host: cfg.imap.host,
+      port: cfg.imap.port,
+      secure: cfg.imap.secure,
+      auth: { user: cfg.username, pass: cfg.appPassword },
+      logger: false,
+    });
     try {
-      await client.logout();
-    } catch {
-      // best-effort
+      await Promise.race([
+        client.connect(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`IMAP connect timed out after ${IMAP_CONNECT_TIMEOUT_MS}ms`)), IMAP_CONNECT_TIMEOUT_MS)
+        ),
+      ]);
+      try {
+        return await fn(client);
+      } finally {
+        try {
+          await client.logout();
+        } catch {
+          // best-effort
+        }
+      }
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const isRetryable = /connection not available|connect timed out|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ETIMEDOUT|socket|network/i.test(msg);
+      if (!isRetryable || attempt === IMAP_RETRY_ATTEMPTS - 1) throw err;
+      try { client.close(); } catch { /* ignore */ }
     }
   }
+  throw lastErr;
 }
 
 async function withMailboxLock<T>(
@@ -574,6 +598,14 @@ function createRuntime(cfg: NormalizedConfig) {
           };
         }
       }
+      // When no temporal filter is given, default to the last DEFAULT_SINCE_DAYS days.
+      // This prevents scanning thousands of old messages and ensures recent mail is always visible.
+      if (!effective.since && !effective.before && !effective.gmailRaw && !effective.beforeUid) {
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - DEFAULT_SINCE_DAYS);
+        effective = { ...effective, since: cutoff.toISOString() };
+      }
+
       const mailbox = effective.mailbox?.trim() || cfg.defaultMailbox;
       const limit = Math.min(effective.limit ?? cfg.defaultSearchLimit, 100);
       const queryGroups = parseQueryGroups(effective.query);
