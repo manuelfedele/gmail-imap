@@ -1,11 +1,25 @@
 # openclaw-gmail-plugin
 
-> A Gmail (and any IMAP/SMTP) plugin for [OpenClaw](https://openclaw.ai) that gives your agents a real mailbox — not a sandbox.
+> A Gmail (and any IMAP/SMTP) plugin for [OpenClaw](https://openclaw.ai) — with **first-class attachment download**.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-2026.4%2B-orange.svg)](https://openclaw.ai)
 
-Read mail. Search threads. Save attachments to disk. Send and reply with thread-aware headers. Move messages between mailboxes. Built on [`imapflow`](https://imapflow.com/) + [`mailparser`](https://nodemailer.com/extras/mailparser/) + [`nodemailer`](https://nodemailer.com/) — battle-tested IMAP/SMTP libs, no SaaS dependencies.
+**The attachment story is the headline.** Most email plugins for AI agents stop at metadata: they tell the model "this message has 3 attachments" and that's it. This one writes the actual files to disk and hands the agent absolute paths it can pipe into every other tool you have — `read`, `web_fetch`, OCR skills, PDF/XLSX/DOCX skills, your own scripts. Invoices, contracts, photos, CSVs — they land somewhere your agent can act on them.
+
+Plus the rest of the boring-but-essential mailbox surface: read, search, send, reply with proper threading, star, move. Built on [`imapflow`](https://imapflow.com/) + [`mailparser`](https://nodemailer.com/extras/mailparser/) + [`nodemailer`](https://nodemailer.com/) — battle-tested IMAP/SMTP libs, no SaaS dependencies, no OAuth dance.
+
+```text
+You: "Open the latest email from my accountant and download the PDFs."
+
+Agent → gmail_messages_search { from: "accountant@firm.com", limit: 1 }
+Agent → gmail_message_attachments_save { uid: 4128 }
+        ↳ saved 2 files to ~/.openclaw/inbox/gmail/INBOX-4128/
+            - Invoice_2026_05.pdf  (124 KB)
+            - Receipts_April.pdf   (812 KB)
+Agent → read("/Users/you/.openclaw/inbox/gmail/INBOX-4128/Invoice_2026_05.pdf")
+        ↳ "Total due: €2,340. Payment by 2026-05-31. Reference: INV-2845."
+```
 
 ---
 
@@ -36,9 +50,9 @@ Read mail. Search threads. Save attachments to disk. Send and reply with thread-
 
 OpenClaw plugins for email tend to either (a) ship as MCP servers wrapping a SaaS API (Gmail OAuth, Mailgun, etc.) or (b) cover only the read path. This plugin keeps it boring on purpose:
 
+- **Attachments are the killer feature.** `gmail_message_attachments_save` writes inbound attachments to a stable local directory and returns absolute paths. Filenames are sanitized; collisions are deterministic; selective download by filename is supported. The agent can then chain `read`/`web_fetch`/PDF-OCR/XLSX-parse/whatever — the file is just a file.
 - **App Password auth** — no OAuth dance, no consent screens, no token refresh logic. Works with Gmail's standard 2FA + App Password flow that most providers also support.
 - **Plain IMAP/SMTP** — defaults are tuned for Gmail (`imap.gmail.com:993`, `smtp.gmail.com:465`), but every provider that speaks IMAP/SMTP works (Fastmail, iCloud, Aruba, Outlook with App Password, custom server, etc.).
-- **Attachments hit your disk**, not just metadata. Agents can read the saved files with the rest of OpenClaw's tooling.
 - **Send confirmation by default** — the agent can't accidentally email your boss; sending requires `confirm: true`.
 - **No telemetry. No third-party calls.** Just IMAP/SMTP to your provider.
 
