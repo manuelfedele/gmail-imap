@@ -1,0 +1,57 @@
+{
+  "name": "openclaw-gmail-plugin",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin for Gmail (and other IMAP/SMTP mailboxes) using App Passwords. Read, search, send, reply, organize, and download attachments.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "gmail",
+    "email",
+    "imap",
+    "smtp"
+  ],
+  "license": "MIT",
+  "author": "Manuel Fedele <manuelfedele@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manuelfedele/openclaw-gmail-plugin.git"
+  },
+  "homepage": "https://github.com/manuelfedele/openclaw-gmail-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/manuelfedele/openclaw-gmail-plugin/issues"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.32.0",
+    "imapflow": "^1.0.180",
+    "mailparser": "^3.7.1",
+    "nodemailer": "^6.9.16"
+  },
+  "devDependencies": {
+    "@types/mailparser": "^3.4.4",
+    "@types/node": "^22.0.0",
+    "@types/nodemailer": "^6.4.16",
+    "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.4.0"
+  }
+}
