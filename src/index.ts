@@ -14,8 +14,10 @@ const DEFAULT_SMTP_HOST = "smtp.gmail.com";
 const DEFAULT_SMTP_PORT = 465;
 const DEFAULT_MAILBOX = "INBOX";
 const DEFAULT_SEARCH_LIMIT = 10;
-const DEFAULT_SEARCH_WINDOW = 100;
 const BODY_TEXT_LIMIT = 4000;
+const PRE_LIMIT_FETCH_FACTOR = 4;
+const PRE_LIMIT_FETCH_MIN = 50;
+const PRE_LIMIT_FETCH_MAX = 500;
 
 interface RawConfig {
   username?: string;
@@ -27,7 +29,6 @@ interface RawConfig {
   smtp?: { host?: string; port?: number; secure?: boolean };
   defaultMailbox?: string;
   defaultSearchLimit?: number;
-  defaultSearchWindow?: number;
   attachmentsDir?: string;
   requireExplicitSendConfirmation?: boolean;
 }
@@ -42,7 +43,6 @@ interface NormalizedConfig {
   smtp: { host: string; port: number; secure: boolean };
   defaultMailbox: string;
   defaultSearchLimit: number;
-  defaultSearchWindow: number;
   attachmentsDir: string;
   requireExplicitSendConfirmation: boolean;
 }
@@ -72,7 +72,6 @@ function normalizeConfig(input: RawConfig): NormalizedConfig {
     },
     defaultMailbox: input.defaultMailbox ?? DEFAULT_MAILBOX,
     defaultSearchLimit: input.defaultSearchLimit ?? DEFAULT_SEARCH_LIMIT,
-    defaultSearchWindow: input.defaultSearchWindow ?? DEFAULT_SEARCH_WINDOW,
     attachmentsDir: input.attachmentsDir ?? join(homedir(), ".openclaw", "inbox", "gmail"),
     requireExplicitSendConfirmation: input.requireExplicitSendConfirmation ?? true,
   };
@@ -91,6 +90,26 @@ function truncate(text: string, max: number): string {
 
 function compactWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function htmlToText(html: string): string {
+  if (!html) return "";
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<\/(?:p|div|li|tr|h[1-6])[^>]*>/gi, "\n")
+    .replace(/<br\s*\/?\s*>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function formatAddress(addr: { name?: string; address?: string } | undefined): string {
@@ -140,7 +159,9 @@ interface MessageSummary {
   flags: string[];
   unread: boolean;
   flagged: boolean;
+  hasAttachments: boolean;
   messageId: string | undefined;
+  threadId?: string;
 }
 
 interface AttachmentMeta {
@@ -155,13 +176,13 @@ interface FullMessage extends MessageSummary {
   attachments: AttachmentMeta[];
   replyTo: string;
   references: string[];
+  bodySource: "text" | "html-fallback" | "none";
 }
 
 async function readSourceText(source: unknown): Promise<string> {
   if (!source) return "";
   if (typeof source === "string") return source;
   if (Buffer.isBuffer(source)) return source.toString("utf8");
-  // imapflow may return a Readable
   const chunks: Buffer[] = [];
   for await (const chunk of source as AsyncIterable<Buffer>) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -169,7 +190,12 @@ async function readSourceText(source: unknown): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function toSummary(mailbox: string, item: FetchMessageObject, bodyText: string): MessageSummary {
+function toSummary(
+  mailbox: string,
+  item: FetchMessageObject,
+  bodyText: string,
+  attachmentCount: number | undefined
+): MessageSummary {
   const flags = Array.from(item.flags ?? []).map(String);
   const subject = item.envelope?.subject ?? "";
   const from = formatAddressList(item.envelope?.from);
@@ -179,6 +205,7 @@ function toSummary(mailbox: string, item: FetchMessageObject, bodyText: string):
   const messageId = Array.isArray(item.envelope?.messageId)
     ? item.envelope?.messageId[0]
     : item.envelope?.messageId;
+  const threadId = (item as any).threadId ? String((item as any).threadId) : undefined;
   return {
     mailbox,
     uid: Number(item.uid),
@@ -187,30 +214,42 @@ function toSummary(mailbox: string, item: FetchMessageObject, bodyText: string):
     to,
     cc,
     date: item.internalDate ? new Date(item.internalDate).toISOString() : null,
-    preview: truncate(previewSource, 160),
+    preview: truncate(previewSource, 200),
     flags,
     unread: !flags.includes("\\Seen"),
     flagged: flags.includes("\\Flagged"),
+    hasAttachments: typeof attachmentCount === "number" ? attachmentCount > 0 : false,
     messageId,
+    threadId,
   };
 }
 
 async function toFullMessage(mailbox: string, item: FetchMessageObject): Promise<FullMessage> {
   const parsed = await simpleParser(await readSourceText(item.source));
-  const summary = toSummary(mailbox, item, parsed.text ?? "");
+  const textBody = (parsed.text ?? "").trim();
+  const html = typeof parsed.html === "string" ? parsed.html : undefined;
+  let bodyText = textBody;
+  let bodySource: FullMessage["bodySource"] = textBody ? "text" : "none";
+  if (!bodyText && html) {
+    bodyText = htmlToText(html);
+    if (bodyText) bodySource = "html-fallback";
+  }
+  const attachments = parsed.attachments ?? [];
+  const summary = toSummary(mailbox, item, bodyText, attachments.length);
   const refs = parsed.references;
   const references = Array.isArray(refs) ? refs.map(String) : refs ? [String(refs)] : [];
   return {
     ...summary,
-    bodyText: (parsed.text ?? "").trim(),
-    html: typeof parsed.html === "string" ? parsed.html : undefined,
-    attachments: (parsed.attachments ?? []).map((a) => ({
+    bodyText,
+    html,
+    attachments: attachments.map((a) => ({
       filename: a.filename ?? undefined,
       contentType: a.contentType,
       size: a.size,
     })),
     replyTo: parsed.replyTo?.text ?? "",
     references,
+    bodySource,
   };
 }
 
@@ -253,7 +292,7 @@ async function withMailboxLock<T>(
 async function fetchMessageByUid(client: ImapFlow, uid: number): Promise<FetchMessageObject> {
   const item = await client.fetchOne(
     String(uid),
-    { uid: true, envelope: true, flags: true, internalDate: true, source: true },
+    { uid: true, envelope: true, flags: true, internalDate: true, source: true, threadId: true } as FetchQueryObject,
     { uid: true }
   );
   if (!item) throw new Error(`Message uid ${uid} not found`);
@@ -266,6 +305,19 @@ function parseDate(value: string | undefined): Date | undefined {
   return Number.isNaN(d.valueOf()) ? undefined : d;
 }
 
+function isGmailHost(host: string): boolean {
+  return /(?:^|\.)gmail\.com$/i.test(host) || /(?:^|\.)googlemail\.com$/i.test(host);
+}
+
+function clientHasGmailExt(client: ImapFlow): boolean {
+  try {
+    const caps = (client as any).serverInfo?.capability ?? [];
+    return Array.isArray(caps) && caps.some((c: string) => /X-GM-EXT-1/i.test(String(c)));
+  } catch {
+    return false;
+  }
+}
+
 interface SearchParams {
   mailbox?: string;
   query?: string;
@@ -274,31 +326,61 @@ interface SearchParams {
   subject?: string;
   unread?: boolean;
   flagged?: boolean;
+  hasAttachment?: boolean;
   since?: string;
   before?: string;
   limit?: number;
+  beforeUid?: number;
+  gmailRaw?: string;
 }
 
-function filterSummary(summary: MessageSummary, p: SearchParams, bodyText: string): boolean {
-  if (typeof p.unread === "boolean" && summary.unread !== p.unread) return false;
-  if (typeof p.flagged === "boolean" && summary.flagged !== p.flagged) return false;
-  if (p.from && !lower(summary.from).includes(lower(p.from))) return false;
-  if (p.to && !lower(`${summary.to},${summary.cc}`).includes(lower(p.to))) return false;
-  if (p.subject && !lower(summary.subject).includes(lower(p.subject))) return false;
-  if (p.query) {
-    const haystack = lower(`${summary.subject} ${summary.from} ${summary.to} ${summary.preview} ${bodyText}`);
-    if (!haystack.includes(lower(p.query))) return false;
+interface SearchInfo {
+  serverSearchUsed: boolean;
+  matchedTotal: number;
+  scanned: number;
+  filteredClientSide: number;
+  truncatedAt?: number;
+  gmailRawUsed?: boolean;
+}
+
+interface SearchResultBundle {
+  messages: MessageSummary[];
+  info: SearchInfo;
+}
+
+function buildServerCriteria(
+  params: SearchParams,
+  primaryQueryTerm: string | undefined,
+  client: ImapFlow,
+  cfg: NormalizedConfig
+): { criteria: any; gmailRawUsed: boolean } {
+  if (params.gmailRaw) {
+    if (!isGmailHost(cfg.imap.host) || !clientHasGmailExt(client)) {
+      throw new Error("gmailRaw was provided but the connected server does not advertise X-GM-EXT-1. Use a Gmail account or remove gmailRaw.");
+    }
+    return { criteria: { gmailRaw: params.gmailRaw }, gmailRawUsed: true };
   }
-  const date = parseDate(summary.date ?? undefined);
-  if (p.since) {
-    const since = parseDate(p.since);
-    if (since && (!date || date.valueOf() < since.valueOf())) return false;
+  const criteria: any = {};
+  if (params.from) criteria.from = params.from;
+  if (params.to) criteria.to = params.to;
+  if (params.subject) criteria.subject = params.subject;
+  if (params.since) {
+    const d = parseDate(params.since);
+    if (d) criteria.since = d;
   }
-  if (p.before) {
-    const before = parseDate(p.before);
-    if (before && (!date || date.valueOf() >= before.valueOf())) return false;
+  if (params.before) {
+    const d = parseDate(params.before);
+    if (d) criteria.before = d;
   }
-  return true;
+  if (params.unread === true) criteria.unseen = true;
+  if (params.unread === false) criteria.seen = true;
+  if (params.flagged === true) criteria.flagged = true;
+  if (params.flagged === false) criteria.unflagged = true;
+  if (primaryQueryTerm) criteria.body = primaryQueryTerm;
+  if (typeof params.beforeUid === "number" && params.beforeUid > 0) {
+    criteria.uid = `1:${params.beforeUid - 1}`;
+  }
+  return { criteria, gmailRawUsed: false };
 }
 
 function createRuntime(cfg: NormalizedConfig) {
@@ -316,50 +398,154 @@ function createRuntime(cfg: NormalizedConfig) {
       });
     },
 
-    async searchMessages(params: SearchParams) {
+    async searchMessages(params: SearchParams): Promise<SearchResultBundle> {
       const mailbox = params.mailbox?.trim() || cfg.defaultMailbox;
       const limit = Math.min(params.limit ?? cfg.defaultSearchLimit, 100);
-      const scanWindow = Math.min(Math.max(cfg.defaultSearchWindow, limit), 500);
-      const needsBody = Boolean(params.query);
+      const queryTerms = (params.query ?? "")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const primaryTerm = queryTerms[0];
+      const additionalTerms = queryTerms.slice(1);
+      const needsBody = additionalTerms.length > 0 || params.hasAttachment !== undefined;
+
       return withImapClient(cfg, (client) =>
         withMailboxLock(client, mailbox, async () => {
-          const status = await client.status(mailbox, { messages: true });
-          const totalMessages = Number(status.messages ?? 0);
-          if (totalMessages === 0) return [];
-          const start = Math.max(1, totalMessages - scanWindow + 1);
+          const { criteria, gmailRawUsed } = buildServerCriteria(params, primaryTerm, client, cfg);
+          const matchedRaw = (await client.search(criteria, { uid: true })) || [];
+          const matchedUids: number[] = (Array.isArray(matchedRaw) ? matchedRaw : []).map(Number);
+          if (!matchedUids.length) {
+            return {
+              messages: [],
+              info: {
+                serverSearchUsed: true,
+                matchedTotal: 0,
+                scanned: 0,
+                filteredClientSide: 0,
+                gmailRawUsed,
+              },
+            };
+          }
+
+          const sortedUids = [...matchedUids].sort((a, b) => b - a);
+          const preLimit = Math.min(
+            PRE_LIMIT_FETCH_MAX,
+            Math.max(PRE_LIMIT_FETCH_MIN, limit * PRE_LIMIT_FETCH_FACTOR)
+          );
+          const fetchTargets = sortedUids.slice(0, preLimit);
+          const truncatedAt =
+            sortedUids.length > preLimit ? sortedUids[preLimit - 1] : undefined;
+
           const fetchQuery: FetchQueryObject = {
             uid: true,
             envelope: true,
             flags: true,
             internalDate: true,
-          };
+            threadId: true,
+          } as FetchQueryObject;
           if (needsBody) fetchQuery.source = true;
+
           const matches: MessageSummary[] = [];
-          for await (const item of client.fetch(`${start}:*`, fetchQuery)) {
-            const bodyText = needsBody && item.source
-              ? (await simpleParser(await readSourceText(item.source))).text ?? ""
-              : "";
-            const summary = toSummary(mailbox, item, bodyText);
-            if (!filterSummary(summary, params, bodyText)) continue;
+          let scanned = 0;
+          let filteredClientSide = 0;
+          for await (const item of client.fetch(fetchTargets.join(","), fetchQuery, { uid: true })) {
+            scanned += 1;
+            let bodyText = "";
+            let attachmentCount: number | undefined;
+            if (needsBody && item.source) {
+              const parsed = await simpleParser(await readSourceText(item.source));
+              const textBody = (parsed.text ?? "").trim();
+              bodyText =
+                textBody ||
+                (typeof parsed.html === "string" ? htmlToText(parsed.html) : "");
+              attachmentCount = (parsed.attachments ?? []).length;
+            }
+            const summary = toSummary(mailbox, item, bodyText, attachmentCount);
+            if (additionalTerms.length) {
+              const haystack = lower(
+                `${summary.subject} ${summary.from} ${summary.to} ${summary.cc} ${bodyText}`
+              );
+              const allMatch = additionalTerms.every((t) => haystack.includes(lower(t)));
+              if (!allMatch) {
+                filteredClientSide += 1;
+                continue;
+              }
+            }
+            if (params.hasAttachment === true && !(attachmentCount && attachmentCount > 0)) {
+              filteredClientSide += 1;
+              continue;
+            }
+            if (params.hasAttachment === false && attachmentCount && attachmentCount > 0) {
+              filteredClientSide += 1;
+              continue;
+            }
             matches.push(summary);
           }
-          return matches
-            .sort((a, b) => {
-              const da = parseDate(a.date ?? undefined)?.valueOf() ?? 0;
-              const db = parseDate(b.date ?? undefined)?.valueOf() ?? 0;
-              return db - da || b.uid - a.uid;
-            })
-            .slice(0, limit);
+          matches.sort((a, b) => {
+            const da = parseDate(a.date ?? undefined)?.valueOf() ?? 0;
+            const db = parseDate(b.date ?? undefined)?.valueOf() ?? 0;
+            return db - da || b.uid - a.uid;
+          });
+          return {
+            messages: matches.slice(0, limit),
+            info: {
+              serverSearchUsed: true,
+              matchedTotal: matchedUids.length,
+              scanned,
+              filteredClientSide,
+              truncatedAt,
+              gmailRawUsed,
+            },
+          };
         })
       );
     },
 
-    async getMessage(params: { mailbox?: string; uid: number }) {
+    async getMessage(params: { mailbox?: string; uid: number }): Promise<FullMessage> {
       const mailbox = params.mailbox?.trim() || cfg.defaultMailbox;
       return withImapClient(cfg, (client) =>
         withMailboxLock(client, mailbox, async () => {
           const item = await fetchMessageByUid(client, params.uid);
           return toFullMessage(mailbox, item);
+        })
+      );
+    },
+
+    async getThread(params: { mailbox?: string; uid: number }): Promise<{
+      mailbox: string;
+      threadId: string;
+      messages: FullMessage[];
+    }> {
+      const mailbox = params.mailbox?.trim() || cfg.defaultMailbox;
+      return withImapClient(cfg, (client) =>
+        withMailboxLock(client, mailbox, async () => {
+          if (!isGmailHost(cfg.imap.host) || !clientHasGmailExt(client)) {
+            throw new Error(
+              "gmail_thread_get requires the X-GM-EXT-1 IMAP extension (Gmail). Switch to a Gmail account or use gmail_message_get for a single message."
+            );
+          }
+          const seed = await client.fetchOne(
+            String(params.uid),
+            { uid: true, threadId: true } as FetchQueryObject,
+            { uid: true }
+          );
+          if (!seed || !(seed as any).threadId) {
+            throw new Error(`Cannot resolve X-GM-THRID for uid ${params.uid}.`);
+          }
+          const threadId = String((seed as any).threadId);
+          const matched = (await client.search({ threadId } as any, { uid: true })) || [];
+          const uids = (Array.isArray(matched) ? matched : []).map(Number).sort((a, b) => a - b);
+          const messages: FullMessage[] = [];
+          for (const uid of uids) {
+            const item = await fetchMessageByUid(client, uid);
+            messages.push(await toFullMessage(mailbox, item));
+          }
+          messages.sort((a, b) => {
+            const da = parseDate(a.date ?? undefined)?.valueOf() ?? 0;
+            const db = parseDate(b.date ?? undefined)?.valueOf() ?? 0;
+            return da - db || a.uid - b.uid;
+          });
+          return { mailbox, threadId, messages };
         })
       );
     },
@@ -490,20 +676,40 @@ function formatMailboxList(mailboxes: Array<{ path: string; name: string; specia
     .join("\n");
 }
 
-function formatMessageList(messages: MessageSummary[]): string {
-  if (!messages.length) return "(no messages)";
-  return messages
-    .map((m) => {
-      const flags = [m.unread ? "unread" : "", m.flagged ? "flagged" : ""].filter(Boolean).join(",");
-      return [
-        `uid ${m.uid} [${m.mailbox}]${flags ? ` (${flags})` : ""}`,
-        `  date: ${m.date ?? "?"}`,
-        `  from: ${m.from}`,
-        `  subject: ${m.subject}`,
-        `  preview: ${m.preview}`,
-      ].join("\n");
-    })
-    .join("\n\n");
+function formatMessageList(messages: MessageSummary[], info?: SearchInfo): string {
+  if (!messages.length) {
+    if (info && info.matchedTotal === 0) {
+      return "(no messages match)";
+    }
+    if (info) {
+      return `(no messages after client-side filters; matched=${info.matchedTotal}, scanned=${info.scanned}, filtered=${info.filteredClientSide})`;
+    }
+    return "(no messages)";
+  }
+  const head = info
+    ? `# ${messages.length} of ${info.matchedTotal} server matches (scanned=${info.scanned}, filtered=${info.filteredClientSide}${info.gmailRawUsed ? ", gmailRaw" : ""}${info.truncatedAt ? `, truncatedAtUid=${info.truncatedAt}` : ""})\n\n`
+    : "";
+  return (
+    head +
+    messages
+      .map((m) => {
+        const flags = [
+          m.unread ? "unread" : "",
+          m.flagged ? "flagged" : "",
+          m.hasAttachments ? "attach" : "",
+        ]
+          .filter(Boolean)
+          .join(",");
+        return [
+          `uid ${m.uid} [${m.mailbox}]${flags ? ` (${flags})` : ""}`,
+          `  date: ${m.date ?? "?"}`,
+          `  from: ${m.from}`,
+          `  subject: ${m.subject}`,
+          `  preview: ${m.preview}`,
+        ].join("\n");
+      })
+      .join("\n\n")
+  );
 }
 
 function formatMessage(message: FullMessage): string {
@@ -518,6 +724,7 @@ function formatMessage(message: FullMessage): string {
   if (message.replyTo) lines.push(`reply-to: ${message.replyTo}`);
   lines.push(`subject: ${message.subject}`);
   lines.push(`flags: ${message.flags.join(", ") || "(none)"}`);
+  if (message.threadId) lines.push(`thread: ${message.threadId}`);
   if (message.attachments.length) {
     lines.push(
       `attachments: ${message.attachments
@@ -527,8 +734,33 @@ function formatMessage(message: FullMessage): string {
   } else {
     lines.push("attachments: (none)");
   }
-  lines.push("", "body:", truncate(message.bodyText || "(no text body)", BODY_TEXT_LIMIT));
+  const bodyHeader =
+    message.bodySource === "html-fallback"
+      ? "body (extracted from html):"
+      : message.bodySource === "none"
+      ? "body: (no text or html)"
+      : "body:";
+  lines.push("", bodyHeader, truncate(message.bodyText || "(empty)", BODY_TEXT_LIMIT));
   return lines.join("\n");
+}
+
+function formatThread(bundle: { mailbox: string; threadId: string; messages: FullMessage[] }): string {
+  const head = `Thread ${bundle.threadId} in ${bundle.mailbox} — ${bundle.messages.length} message(s)`;
+  const items = bundle.messages.map((m, idx) => {
+    const flags = [m.unread ? "unread" : "", m.flagged ? "flagged" : "", m.hasAttachments ? "attach" : ""]
+      .filter(Boolean)
+      .join(",");
+    return [
+      `--- [${idx + 1}/${bundle.messages.length}] uid ${m.uid}${flags ? ` (${flags})` : ""}`,
+      `date: ${m.date ?? "?"}`,
+      `from: ${m.from}`,
+      `to: ${m.to}`,
+      `subject: ${m.subject}`,
+      "",
+      truncate(m.bodyText || "(empty)", 1500),
+    ].join("\n");
+  });
+  return [head, "", ...items].join("\n");
 }
 
 function toolTextResult<T extends Record<string, unknown>>(text: string, details: T) {
@@ -552,7 +784,7 @@ const attachmentInputSchema = Type.Object({
 export default definePluginEntry({
   id: "gmail",
   name: "Gmail",
-  description: "Read, search, send, reply, organize, and download attachments over IMAP/SMTP using a Gmail App Password.",
+  description: "Read, search (server-side IMAP + Gmail X-GM-RAW), send, reply, organize, and download attachments using a Gmail App Password.",
   register(api: any) {
     const cfg = normalizeConfig((api.pluginConfig ?? {}) as RawConfig);
     const runtime = createRuntime(cfg);
@@ -574,8 +806,9 @@ export default definePluginEntry({
 
     api.registerTool({
       name: "gmail_messages_search",
-      label: "Search messages",
-      description: "Search recent messages by sender, recipient, subject, free text, flags, or date range.",
+      label: "Search messages (server-side)",
+      description:
+        "Server-side IMAP search across the entire mailbox. `query` is split on whitespace into AND terms; the first term is sent as IMAP BODY and the rest are matched client-side against subject/from/to/cc/body. Use `gmailRaw` for the full Gmail search syntax (Gmail accounts only). Filters: `from`, `to`, `subject`, `unread`, `flagged`, `hasAttachment`, `since`, `before`, `beforeUid` (cursor for pagination). Default `limit` 10, max 100.",
       parameters: Type.Object({
         mailbox: Type.Optional(Type.String({ minLength: 1 })),
         query: Type.Optional(Type.String({ minLength: 1 })),
@@ -584,16 +817,20 @@ export default definePluginEntry({
         subject: Type.Optional(Type.String({ minLength: 1 })),
         unread: Type.Optional(Type.Boolean()),
         flagged: Type.Optional(Type.Boolean()),
+        hasAttachment: Type.Optional(Type.Boolean()),
         since: Type.Optional(Type.String({ minLength: 1 })),
         before: Type.Optional(Type.String({ minLength: 1 })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+        beforeUid: Type.Optional(Type.Integer({ minimum: 1 })),
+        gmailRaw: Type.Optional(Type.String({ minLength: 1 })),
       }),
       async execute(_id: unknown, params: SearchParams) {
-        const messages = await runtime.searchMessages(params);
-        return toolTextResult(formatMessageList(messages), {
+        const result = await runtime.searchMessages(params);
+        return toolTextResult(formatMessageList(result.messages, result.info), {
           status: "ok",
-          count: messages.length,
-          messages,
+          count: result.messages.length,
+          messages: result.messages,
+          info: result.info,
         });
       },
     });
@@ -601,7 +838,8 @@ export default definePluginEntry({
     api.registerTool({
       name: "gmail_message_get",
       label: "Get message",
-      description: "Fetch one message by UID with body and attachment metadata.",
+      description:
+        "Fetch one message by UID with body and attachment metadata. If the message has only HTML, the body is auto-extracted to plain text (bodySource='html-fallback').",
       parameters: Type.Object({
         mailbox: Type.Optional(Type.String({ minLength: 1 })),
         uid: Type.Integer({ minimum: 1 }),
@@ -609,6 +847,21 @@ export default definePluginEntry({
       async execute(_id: unknown, params: { mailbox?: string; uid: number }) {
         const message = await runtime.getMessage(params);
         return toolTextResult(formatMessage(message), { status: "ok", message });
+      },
+    });
+
+    api.registerTool({
+      name: "gmail_thread_get",
+      label: "Get thread (Gmail)",
+      description:
+        "Fetch every message in the same Gmail thread as the given UID, ordered chronologically. Requires the IMAP X-GM-EXT-1 extension (Gmail).",
+      parameters: Type.Object({
+        mailbox: Type.Optional(Type.String({ minLength: 1 })),
+        uid: Type.Integer({ minimum: 1 }),
+      }),
+      async execute(_id: unknown, params: { mailbox?: string; uid: number }) {
+        const bundle = await runtime.getThread(params);
+        return toolTextResult(formatThread(bundle), { status: "ok", ...bundle });
       },
     });
 

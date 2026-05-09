@@ -1,13 +1,14 @@
 {
   "id": "gmail",
   "name": "Gmail",
-  "description": "Gmail (and IMAP/SMTP) plugin for OpenClaw using App Passwords. Read, search, send, reply, organize, and download attachments.",
-  "version": "0.1.0",
+  "description": "Gmail (and IMAP/SMTP) plugin for OpenClaw using App Passwords. Server-side IMAP search with Gmail X-GM-RAW, multi-term AND, hasAttachment, thread fetch, HTML→text fallback, and attachment download to disk.",
+  "version": "0.2.0",
   "contracts": {
     "tools": [
       "gmail_mailboxes_list",
       "gmail_messages_search",
       "gmail_message_get",
+      "gmail_thread_get",
       "gmail_message_send",
       "gmail_message_reply",
       "gmail_message_update",
@@ -65,12 +66,6 @@
         "minimum": 1,
         "maximum": 100,
         "default": 10
-      },
-      "defaultSearchWindow": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 500,
-        "default": 100
       },
       "attachmentsDir": {
         "type": "string",

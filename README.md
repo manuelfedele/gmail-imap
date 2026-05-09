@@ -146,14 +146,31 @@ Now ask your agent:
 
 | Tool | Purpose |
 | --- | --- |
-| `gmail_mailboxes_list` | List folders/labels on the account |
-| `gmail_messages_search` | Search recent messages by `from`, `to`, `subject`, free-text `query`, `unread`/`flagged`, `since`/`before`, `limit`. Defaults to scanning the most recent 100 messages in `INBOX`. |
-| `gmail_message_get` | Fetch one message by `mailbox`+`uid`. Returns body text, attachment metadata, references, reply-to. |
+| `gmail_mailboxes_list` | List folders/labels on the account. |
+| `gmail_messages_search` | **Server-side IMAP search** across the entire mailbox. `query` is split on whitespace into AND terms. `gmailRaw` gives you the full Gmail web search syntax. Filters: `from`, `to`, `subject`, `unread`, `flagged`, **`hasAttachment`**, `since`, `before`, `beforeUid` (cursor for pagination). |
+| `gmail_message_get` | Fetch one message by `mailbox`+`uid`. Returns body text, attachment metadata, thread id, references, reply-to. **HTML→text fallback** when the message has no plain-text part. |
+| `gmail_thread_get` | Fetch every message in the same Gmail thread as a UID, in chronological order. Requires the X-GM-EXT-1 IMAP extension (Gmail). |
 | `gmail_message_attachments_save` | Download all (or filtered) attachments of a message to disk. Returns absolute paths so the agent can open them. |
 | `gmail_message_update` | Set `read` and/or `flagged` (starred) on a message. |
 | `gmail_message_move` | Move a message between mailboxes (e.g. INBOX → Archive). |
 | `gmail_message_send` | Send a new email. Requires `confirm: true` by default. |
 | `gmail_message_reply` | Reply to a message by UID, with optional `replyAll`. Sets `In-Reply-To` and `References` for proper threading. Quotes the original body. Requires `confirm: true` by default. |
+
+### Search examples
+
+```jsonc
+// Find unread emails from accountant in the last 14 days, with attachments only
+{ "from": "accountant@firm.com", "unread": true, "since": "2026-04-25", "hasAttachment": true }
+
+// Multi-term AND: every word must appear somewhere in subject/from/to/cc/body
+{ "query": "stripe invoice 2026" }
+
+// Full Gmail search syntax (Gmail accounts only) — same as the search box on gmail.com
+{ "gmailRaw": "from:stripe.com subject:invoice has:attachment after:2026/04/01" }
+
+// Pagination: get the next page after the oldest UID you saw last time
+{ "from": "newsletter@", "limit": 20, "beforeUid": 4093 }
+```
 
 All tools use the configured account; the agent doesn't pick credentials.
 
@@ -176,7 +193,6 @@ All tools use the configured account; the agent doesn't pick credentials.
 | `smtp.secure` | bool | `true` | Use TLS for SMTP (`true` = implicit TLS, `false` typically pairs with port 587 for STARTTLS). |
 | `defaultMailbox` | string | `INBOX` | Mailbox used when a tool call omits one. |
 | `defaultSearchLimit` | int | `10` | Default `limit` for `gmail_messages_search`. |
-| `defaultSearchWindow` | int | `100` | How many recent messages to scan during a search. Higher = slower but covers older mail. |
 | `attachmentsDir` | string | `~/.openclaw/inbox/gmail` | Base directory for saved attachments. |
 | `requireExplicitSendConfirmation` | bool | `true` | When true, `gmail_message_send` and `gmail_message_reply` refuse to run without `confirm: true`. |
 
@@ -283,15 +299,18 @@ openclaw plugins install /path/to/this/repo
 
 Check `tools.alsoAllow` in your config — without it the profile (e.g. `coding`) won't expose plugin tools. The README's [Configure](#3-configure) snippet shows the full list.
 
-### `gmail_messages_search` returns nothing for old emails
+### `gmail_messages_search` returns nothing for old emails (v0.1.x)
 
-`defaultSearchWindow` only scans the most recent N messages (default 100). Increase it:
+In v0.1.x, search only scanned the most recent ~100 messages. Upgrade to v0.2.0+ — search is now **server-side** and covers the entire mailbox by default. No `defaultSearchWindow` needed (the option has been removed).
 
-```jsonc
-{ "defaultSearchWindow": 500 }
-```
+### Search returns 0 even though I know the message exists
 
-Higher windows are slower because the IMAP source has to be fetched and parsed for free-text matching.
+Likely causes:
+
+- **Multi-word `query`**: in v0.2.0 every whitespace-separated word must appear (AND), in any field. If you typed an exact phrase you don't have, you'll get 0. Try fewer words.
+- **Wrong mailbox**: server search is scoped to the mailbox you specify (default `INBOX`). For sent mail try `mailbox: "[Gmail]/Sent Mail"` (or `[Gmail]/Posta inviata` etc. — IMAP folder names are localized). Use `gmail_mailboxes_list` to see exact paths.
+- **Date filter**: `since`/`before` are inclusive of `since`, exclusive of `before`. ISO `YYYY-MM-DD` is safe.
+- **Try `gmailRaw`** for ground truth: it's the same query the Gmail web UI runs.
 
 ### Attachments not saved / "no buffer content"
 
@@ -337,6 +356,24 @@ PRs welcome — see [Contributing](#contributing).
 
 ---
 
+## Changelog
+
+### 0.2.0
+
+- **Server-side IMAP search**: `gmail_messages_search` now uses `UID SEARCH` and covers the entire mailbox. The `defaultSearchWindow` config option has been removed.
+- **Multi-term AND**: `query` is split on whitespace; every term must appear in subject/from/to/cc/body.
+- **Gmail X-GM-RAW**: pass `gmailRaw` to use the full Gmail web search syntax (`from:foo has:attachment after:2026/01/01 subject:"weekly report"`). Gmail-only.
+- **`hasAttachment` filter** in search.
+- **`gmail_thread_get`**: fetch all messages in a Gmail thread by giving any UID from it.
+- **HTML→text fallback** in `gmail_message_get`: HTML-only messages now produce a readable plain-text body (`bodySource: "html-fallback"`).
+- **`beforeUid` cursor** for paging through large result sets.
+- **Search diagnostics**: tool result includes `info.matchedTotal`, `info.scanned`, `info.filteredClientSide`, `info.gmailRawUsed`.
+- Summaries now expose `hasAttachments` and `threadId`.
+
+### 0.1.0
+
+- Initial release: read, search (windowed scan), send, reply, flag/move, attachment download.
+
 ## Roadmap
 
 These are likely-next items, not commitments:
@@ -344,7 +381,6 @@ These are likely-next items, not commitments:
 - [ ] OAuth2 auth path (no app password, for orgs that disallow them)
 - [ ] Watch / push notifications (IDLE) → emit OpenClaw events on new mail
 - [ ] Attachment streaming for large files (current implementation buffers in memory)
-- [ ] Server-side IMAP search (`UID SEARCH SUBJECT ...`) instead of scanning a window
 - [ ] Multi-account support (multiple `gmail` instances in a single config)
 - [ ] Skill bundle with prompt examples for common workflows (triage, weekly digest)
 
