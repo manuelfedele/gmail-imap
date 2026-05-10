@@ -1,6 +1,6 @@
 {
   "name": "@manuelfedele/openclaw-gmail-plugin",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "OpenClaw plugin for Gmail (and other IMAP/SMTP mailboxes) using App Passwords. Server-side IMAP search with Gmail X-GM-RAW, multi-term AND, hasAttachment filter, thread fetch, HTML→text fallback, and attachment download to disk.",
   "type": "module",
   "main": "./dist/index.js",
