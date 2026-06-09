@@ -1,24 +1,20 @@
 {
-  "name": "@manuelfedele/openclaw-gmail-plugin",
-  "version": "0.4.0",
-  "description": "OpenClaw plugin for Gmail (and other IMAP/SMTP mailboxes) using App Passwords. Server-side IMAP search with Gmail X-GM-RAW, multi-term AND, hasAttachment filter, thread fetch, HTML→text fallback, and attachment download to disk.",
+  "name": "gmail-imap",
+  "version": "1.0.0",
+  "description": "Claude plugin: Gmail (and any IMAP/SMTP mailbox) via App Passwords. Server-side IMAP search with Gmail X-GM-RAW, thread fetch, HTML→text fallback, send/reply with confirmation guardrail, and attachment download to disk.",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": [
-    "dist",
-    "openclaw.plugin.json",
-    "README.md",
-    "LICENSE"
-  ],
+  "private": true,
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/index.cjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "clean": "rm -rf dist"
   },
   "keywords": [
-    "openclaw",
+    "claude",
+    "claude-code",
+    "cowork",
     "plugin",
+    "mcp",
     "gmail",
     "email",
     "imap",
@@ -28,39 +24,24 @@
   "author": "Manuel Fedele <manuelfedele@gmail.com>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/manuelfedele/openclaw-gmail-plugin.git"
+    "url": "git+https://github.com/manuelfedele/gmail-imap.git"
   },
-  "homepage": "https://github.com/manuelfedele/openclaw-gmail-plugin#readme",
+  "homepage": "https://github.com/manuelfedele/gmail-imap#readme",
   "bugs": {
-    "url": "https://github.com/manuelfedele/openclaw-gmail-plugin/issues"
-  },
-  "openclaw": {
-    "extensions": [
-      "./dist/index.js"
-    ],
-    "compat": {
-      "pluginApi": ">=2026.4.0"
-    },
-    "build": {
-      "openclawVersion": "2026.5.7"
-    },
-    "install": {
-      "minHostVersion": ">=2026.4.0"
-    }
+    "url": "https://github.com/manuelfedele/gmail-imap/issues"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.32.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
     "imapflow": "^1.0.180",
     "mailparser": "^3.7.1",
-    "nodemailer": "^6.9.16"
+    "nodemailer": "^6.9.16",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@types/mailparser": "^3.4.4",
     "@types/node": "^22.0.0",
     "@types/nodemailer": "^6.4.16",
+    "esbuild": "^0.25.0",
     "typescript": "^5.6.0"
-  },
-  "peerDependencies": {
-    "openclaw": ">=2026.4.0"
   }
 }

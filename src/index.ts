@@ -1,12 +1,12 @@
-import { Type } from "@sinclair/typebox";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ImapFlow, type FetchMessageObject, type FetchQueryObject } from "imapflow";
 import { simpleParser, type ParsedMail, type Attachment as ParsedAttachment } from "mailparser";
 import nodemailer from "nodemailer";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-// @ts-ignore - resolved at runtime by the OpenClaw host
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { z } from "zod";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -54,12 +54,74 @@ interface NormalizedConfig {
   requireExplicitSendConfirmation: boolean;
 }
 
+const CONFIG_PATH = process.env.GMAIL_IMAP_CONFIG ?? join(homedir(), ".gmail-imap", "config.json");
+
+const CONFIG_HELP = [
+  "gmail-imap is not configured. Provide credentials one of two ways:",
+  "",
+  `1. Config file at ${CONFIG_PATH} (recommended):`,
+  '   { "username": "you@gmail.com", "appPassword": "xxxxxxxxxxxxxxxx", "fromName": "Your Name" }',
+  "",
+  "2. Environment variables: GMAIL_USERNAME, GMAIL_APP_PASSWORD (plus optional GMAIL_FROM,",
+  "   GMAIL_FROM_NAME, GMAIL_REPLY_TO, GMAIL_IMAP_HOST/PORT, GMAIL_SMTP_HOST/PORT,",
+  "   GMAIL_DEFAULT_MAILBOX, GMAIL_ATTACHMENTS_DIR).",
+  "",
+  "Generate a Gmail App Password at https://myaccount.google.com/apppasswords (requires 2FA).",
+].join("\n");
+
+function envBool(value: string | undefined): boolean | undefined {
+  if (value === undefined || value === "") return undefined;
+  return !/^(?:0|false|no|off)$/i.test(value);
+}
+
+function envInt(value: string | undefined): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const n = Number.parseInt(value, 10);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+/** Merge config file (if present) with environment variables. Env wins. */
+async function loadRawConfig(): Promise<RawConfig> {
+  let fileConfig: RawConfig = {};
+  try {
+    fileConfig = JSON.parse(await readFile(CONFIG_PATH, "utf8")) as RawConfig;
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      throw new Error(`gmail-imap: failed to read config at ${CONFIG_PATH}: ${err?.message ?? err}`);
+    }
+  }
+  const env = process.env;
+  return {
+    ...fileConfig,
+    username: env.GMAIL_USERNAME ?? fileConfig.username,
+    appPassword: env.GMAIL_APP_PASSWORD ?? fileConfig.appPassword,
+    from: env.GMAIL_FROM ?? fileConfig.from,
+    fromName: env.GMAIL_FROM_NAME ?? fileConfig.fromName,
+    replyTo: env.GMAIL_REPLY_TO ?? fileConfig.replyTo,
+    imap: {
+      host: env.GMAIL_IMAP_HOST ?? fileConfig.imap?.host,
+      port: envInt(env.GMAIL_IMAP_PORT) ?? fileConfig.imap?.port,
+      secure: envBool(env.GMAIL_IMAP_SECURE) ?? fileConfig.imap?.secure,
+    },
+    smtp: {
+      host: env.GMAIL_SMTP_HOST ?? fileConfig.smtp?.host,
+      port: envInt(env.GMAIL_SMTP_PORT) ?? fileConfig.smtp?.port,
+      secure: envBool(env.GMAIL_SMTP_SECURE) ?? fileConfig.smtp?.secure,
+    },
+    defaultMailbox: env.GMAIL_DEFAULT_MAILBOX ?? fileConfig.defaultMailbox,
+    defaultSearchLimit: envInt(env.GMAIL_DEFAULT_SEARCH_LIMIT) ?? fileConfig.defaultSearchLimit,
+    attachmentsDir: env.GMAIL_ATTACHMENTS_DIR ?? fileConfig.attachmentsDir,
+    requireExplicitSendConfirmation:
+      envBool(env.GMAIL_REQUIRE_SEND_CONFIRMATION) ?? fileConfig.requireExplicitSendConfirmation,
+  };
+}
+
 function normalizeConfig(input: RawConfig): NormalizedConfig {
   if (!input.username || !input.username.includes("@")) {
-    throw new Error("gmail plugin: 'username' is required and must be a full email address");
+    throw new Error(CONFIG_HELP);
   }
   if (!input.appPassword) {
-    throw new Error("gmail plugin: 'appPassword' is required");
+    throw new Error(CONFIG_HELP);
   }
   return {
     username: input.username,
@@ -79,7 +141,7 @@ function normalizeConfig(input: RawConfig): NormalizedConfig {
     },
     defaultMailbox: input.defaultMailbox ?? DEFAULT_MAILBOX,
     defaultSearchLimit: input.defaultSearchLimit ?? DEFAULT_SEARCH_LIMIT,
-    attachmentsDir: input.attachmentsDir ?? join(homedir(), ".openclaw", "inbox", "gmail"),
+    attachmentsDir: input.attachmentsDir ?? join(homedir(), ".gmail-imap", "attachments"),
     requireExplicitSendConfirmation: input.requireExplicitSendConfirmation ?? true,
   };
 }
@@ -928,254 +990,303 @@ function formatThread(bundle: { mailbox: string; threadId: string; messages: Ful
   ].join("\n");
 }
 
-function toolTextResult<T extends Record<string, unknown>>(text: string, details: T) {
-  return { content: [{ type: "text" as const, text }], details };
+function toolTextResult(text: string) {
+  return { content: [{ type: "text" as const, text }] };
 }
 
-// ─── Plugin entry ─────────────────────────────────────────────────────────────
+// ─── MCP server ───────────────────────────────────────────────────────────────
 
-const recipientSchema = Type.Union([
-  Type.String({ minLength: 1 }),
-  Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
-]);
+type Runtime = ReturnType<typeof createRuntime>;
 
-const attachmentInputSchema = Type.Object({
-  path: Type.String({ minLength: 1 }),
-  filename: Type.Optional(Type.String({ minLength: 1 })),
-  contentType: Type.Optional(Type.String({ minLength: 1 })),
+let runtimeState: { cfg: NormalizedConfig; runtime: Runtime } | undefined;
+
+/** Config is loaded lazily so a missing config produces a helpful tool error instead of a dead server. */
+async function getRuntime(): Promise<{ cfg: NormalizedConfig; runtime: Runtime }> {
+  if (!runtimeState) {
+    const cfg = normalizeConfig(await loadRawConfig());
+    runtimeState = { cfg, runtime: createRuntime(cfg) };
+  }
+  return runtimeState;
+}
+
+const recipientSchema = z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]);
+
+const attachmentInputSchema = z.object({
+  path: z.string().min(1),
+  filename: z.string().min(1).optional(),
+  contentType: z.string().min(1).optional(),
 });
 
-export default definePluginEntry({
-  id: "gmail",
-  name: "Gmail",
-  description: "Read, search (server-side IMAP + Gmail X-GM-RAW), send, reply, organize, and download attachments using a Gmail App Password.",
-  register(api: any) {
-    const cfg = normalizeConfig((api.pluginConfig ?? {}) as RawConfig);
-    const runtime = createRuntime(cfg);
+const server = new McpServer({ name: "gmail-imap", version: "1.0.0" });
 
-    api.registerTool({
-      name: "gmail_mailboxes_list",
-      label: "List mailboxes",
-      description: "List the mailboxes (folders/labels) on the configured account.",
-      parameters: Type.Object({}, { additionalProperties: false }),
-      async execute() {
-        const mailboxes = await runtime.listMailboxes();
-        return toolTextResult(formatMailboxList(mailboxes), { status: "ok", count: mailboxes.length, mailboxes });
-      },
-    });
-
-    api.registerTool({
-      name: "gmail_messages_search",
-      label: "Search messages",
-      description:
-        "Server-side IMAP search. `query` accepts free text (AND by default) or `OR` for alternation. Inline Gmail-style operators are auto-extracted: `from:`, `to:`, `subject:`, `has:attachment`, `is:unread`, `is:starred`, `in:LABEL`, `before:YYYY-MM-DD`, `after:YYYY-MM-DD`. Explicit params win over inline operators. Use `gmailRaw` to pass a raw Gmail search expression (Gmail only). When no date range is provided, defaults to the last 30 days. Paginate by passing `before` with the `date` field of the last seen message.",
-      parameters: Type.Object({
-        mailbox: Type.Optional(Type.String({ minLength: 1 })),
-        query: Type.Optional(Type.String({ minLength: 1 })),
-        from: Type.Optional(Type.String({ minLength: 1 })),
-        to: Type.Optional(Type.String({ minLength: 1 })),
-        subject: Type.Optional(Type.String({ minLength: 1 })),
-        unread: Type.Optional(Type.Boolean()),
-        flagged: Type.Optional(Type.Boolean()),
-        hasAttachment: Type.Optional(Type.Boolean()),
-        since: Type.Optional(Type.String({ minLength: 1 })),
-        before: Type.Optional(Type.String({ minLength: 1, description: "Upper bound on internalDate (ISO or YYYY-MM-DD). Use as pagination cursor." })),
-        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-        gmailRaw: Type.Optional(Type.String({ minLength: 1 })),
-      }),
-      async execute(_id: unknown, params: SearchParams) {
-        const result = await runtime.searchMessages(params);
-        return toolTextResult(formatMessageList(result.messages, result.info), {
-          status: "ok",
-          count: result.messages.length,
-          messages: result.messages,
-          info: result.info,
-        });
-      },
-    });
-
-    api.registerTool({
-      name: "gmail_message_get",
-      label: "Get message",
-      description: "Fetch one message by UID with full body and attachment metadata. HTML-only messages are auto-converted to plain text.",
-      parameters: Type.Object({
-        mailbox: Type.Optional(Type.String({ minLength: 1 })),
-        uid: Type.Integer({ minimum: 1 }),
-      }),
-      async execute(_id: unknown, params: { mailbox?: string; uid: number }) {
-        const message = await runtime.getMessage(params);
-        return toolTextResult(formatMessage(message), { status: "ok", message });
-      },
-    });
-
-    api.registerTool({
-      name: "gmail_thread_get",
-      label: "Get thread (Gmail)",
-      description: "Fetch all messages in the same Gmail thread as the given UID, ordered chronologically. Requires Gmail (X-GM-EXT-1). All thread messages are fetched in a single IMAP round-trip.",
-      parameters: Type.Object({
-        mailbox: Type.Optional(Type.String({ minLength: 1 })),
-        uid: Type.Integer({ minimum: 1 }),
-      }),
-      async execute(_id: unknown, params: { mailbox?: string; uid: number }) {
-        const bundle = await runtime.getThread(params);
-        return toolTextResult(formatThread(bundle), { status: "ok", ...bundle });
-      },
-    });
-
-    api.registerTool({
-      name: "gmail_message_attachments_save",
-      label: "Save attachments",
-      description: "Download all (or filtered) attachments of one message to the configured attachments directory.",
-      parameters: Type.Object({
-        mailbox: Type.Optional(Type.String({ minLength: 1 })),
-        uid: Type.Integer({ minimum: 1 }),
-        filenames: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
-      }),
-      async execute(_id: unknown, params: { mailbox?: string; uid: number; filenames?: string[] }) {
-        const result = await runtime.downloadAttachments(params);
-        const lines = [
-          `mailbox: ${result.mailbox}`,
-          `uid: ${result.uid}`,
-          `directory: ${result.directory}`,
-          `saved: ${result.saved.length}`,
-          ...result.saved.map((a) => `  - ${a.filename} (${a.contentType ?? "?"}, ${a.size}B) -> ${a.path}`),
-        ];
-        if (result.skipped.length) {
-          lines.push(`skipped: ${result.skipped.length}`);
-          for (const s of result.skipped) lines.push(`  - ${s.filename}: ${s.reason}`);
-        }
-        return toolTextResult(lines.join("\n"), { status: result.saved.length > 0 ? "ok" : "empty", ...result });
-      },
-    });
-
-    api.registerTool({
-      name: "gmail_message_update",
-      label: "Update flags",
-      description: "Mark one message as read/unread and/or set/clear its starred state.",
-      parameters: Type.Object({
-        mailbox: Type.Optional(Type.String({ minLength: 1 })),
-        uid: Type.Integer({ minimum: 1 }),
-        read: Type.Optional(Type.Boolean()),
-        flagged: Type.Optional(Type.Boolean()),
-      }),
-      async execute(_id: unknown, params: { mailbox?: string; uid: number; read?: boolean; flagged?: boolean }) {
-        if (typeof params.read !== "boolean" && typeof params.flagged !== "boolean") {
-          throw new Error("Provide at least one flag update: read and/or flagged.");
-        }
-        const result = await runtime.updateMessage(params);
-        return toolTextResult(
-          `Updated ${result.mailbox} uid ${result.uid}${typeof result.read === "boolean" ? ` read=${result.read}` : ""}${typeof result.flagged === "boolean" ? ` flagged=${result.flagged}` : ""}`,
-          { status: "updated", ...result }
-        );
-      },
-    });
-
-    api.registerTool({
-      name: "gmail_message_move",
-      label: "Move message",
-      description: "Move one message to another mailbox.",
-      parameters: Type.Object({
-        mailbox: Type.Optional(Type.String({ minLength: 1 })),
-        uid: Type.Integer({ minimum: 1 }),
-        destinationMailbox: Type.String({ minLength: 1 }),
-      }),
-      async execute(_id: unknown, params: { mailbox?: string; uid: number; destinationMailbox: string }) {
-        const result = await runtime.moveMessage(params);
-        return toolTextResult(
-          `Moved uid ${result.uid} from ${result.sourceMailbox} to ${result.destinationMailbox}`,
-          { status: "moved", ...result }
-        );
-      },
-    });
-
-    api.registerTool({
-      name: "gmail_message_send",
-      label: "Send message",
-      description: "Send a new email. With requireExplicitSendConfirmation=true (default), must pass confirm=true.",
-      parameters: Type.Object({
-        to: recipientSchema,
-        cc: Type.Optional(recipientSchema),
-        bcc: Type.Optional(recipientSchema),
-        subject: Type.String({ minLength: 1 }),
-        text: Type.Optional(Type.String()),
-        html: Type.Optional(Type.String()),
-        attachments: Type.Optional(Type.Array(attachmentInputSchema)),
-        confirm: Type.Optional(Type.Boolean()),
-      }),
-      async execute(_id: unknown, params: any) {
-        if (cfg.requireExplicitSendConfirmation && params.confirm !== true) {
-          return toolTextResult(
-            "Refusing to send: requireExplicitSendConfirmation is enabled and confirm=true was not provided.",
-            { status: "refused", reason: "missing_confirmation" }
-          );
-        }
-        if (!params.text && !params.html) throw new Error("Provide text and/or html body");
-        const result = await runtime.sendMessage(params);
-        return toolTextResult(
-          `Sent. accepted=[${result.accepted.join(", ")}] rejected=[${result.rejected.join(", ")}] subject="${result.subject}"`,
-          { status: "sent", ...result }
-        );
-      },
-    });
-
-    api.registerTool({
-      name: "gmail_message_reply",
-      label: "Reply to message",
-      description: "Reply to an existing message by UID. replyAll=true CCs all original recipients (excluding self).",
-      parameters: Type.Object({
-        mailbox: Type.Optional(Type.String({ minLength: 1 })),
-        uid: Type.Integer({ minimum: 1 }),
-        text: Type.Optional(Type.String()),
-        html: Type.Optional(Type.String()),
-        replyAll: Type.Optional(Type.Boolean()),
-        attachments: Type.Optional(Type.Array(attachmentInputSchema)),
-        confirm: Type.Optional(Type.Boolean()),
-      }),
-      async execute(_id: unknown, params: any) {
-        if (cfg.requireExplicitSendConfirmation && params.confirm !== true) {
-          return toolTextResult(
-            "Refusing to reply: requireExplicitSendConfirmation is enabled and confirm=true was not provided.",
-            { status: "refused", reason: "missing_confirmation" }
-          );
-        }
-        if (!params.text && !params.html) throw new Error("Provide text and/or html body");
-        const original = await runtime.getMessage(params);
-        const ownAddresses = uniqueStrings([lower(cfg.from), lower(cfg.username)]);
-        const replyTarget = original.replyTo || original.from;
-        const subject = /^re:/i.test(original.subject) ? original.subject : `Re: ${original.subject}`;
-        const messageIdRef = original.messageId
-          ? `<${String(original.messageId).replace(/^<|>$/g, "")}>`
-          : undefined;
-        const references = uniqueStrings([...(original.references ?? []), messageIdRef ?? ""].filter(Boolean));
-        let to: string[];
-        let cc: string[] = [];
-        if (params.replyAll) {
-          const all = uniqueStrings(
-            [replyTarget, original.to, original.cc].join(",").split(",").map((s) => s.trim()).filter(Boolean)
-          ).filter((addr) => !ownAddresses.includes(lower(addr)));
-          to = all.slice(0, 1);
-          cc = all.slice(1);
-        } else {
-          to = [replyTarget].filter(Boolean);
-        }
-        const quoted = original.bodyText
-          ? `\n\nOn ${original.date ?? ""}, ${original.from} wrote:\n${original.bodyText.split("\n").map((l) => `> ${l}`).join("\n")}`
-          : "";
-        const result = await runtime.sendMessage({
-          to,
-          cc,
-          subject,
-          text: params.text ? `${params.text}${quoted}` : undefined,
-          html: params.html,
-          inReplyTo: messageIdRef,
-          references,
-          attachments: params.attachments,
-        });
-        return toolTextResult(
-          `Replied. accepted=[${result.accepted.join(", ")}] subject="${result.subject}"`,
-          { status: "sent", ...result }
-        );
-      },
-    });
+server.registerTool(
+  "gmail_mailboxes_list",
+  {
+    title: "List mailboxes",
+    description: "List the mailboxes (folders/labels) on the configured account.",
+    inputSchema: {},
   },
+  async () => {
+    const { runtime } = await getRuntime();
+    const mailboxes = await runtime.listMailboxes();
+    return toolTextResult(formatMailboxList(mailboxes));
+  }
+);
+
+server.registerTool(
+  "gmail_messages_search",
+  {
+    title: "Search messages",
+    description:
+      "Server-side IMAP search. `query` accepts free text (AND by default) or `OR` for alternation. Inline Gmail-style operators are auto-extracted: `from:`, `to:`, `subject:`, `has:attachment`, `is:unread`, `is:starred`, `in:LABEL`, `before:YYYY-MM-DD`, `after:YYYY-MM-DD`. Explicit params win over inline operators. Use `gmailRaw` to pass a raw Gmail search expression (Gmail only). When no date range is provided, defaults to the last 30 days. Paginate by passing `before` with the `date` field of the last seen message.",
+    inputSchema: {
+      mailbox: z.string().min(1).optional(),
+      query: z.string().min(1).optional(),
+      from: z.string().min(1).optional(),
+      to: z.string().min(1).optional(),
+      subject: z.string().min(1).optional(),
+      unread: z.boolean().optional(),
+      flagged: z.boolean().optional(),
+      hasAttachment: z.boolean().optional(),
+      since: z.string().min(1).optional(),
+      before: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Upper bound on internalDate (ISO or YYYY-MM-DD). Use as pagination cursor."),
+      limit: z.number().int().min(1).max(100).optional(),
+      gmailRaw: z.string().min(1).optional(),
+    },
+  },
+  async (params: SearchParams) => {
+    const { runtime } = await getRuntime();
+    const result = await runtime.searchMessages(params);
+    return toolTextResult(formatMessageList(result.messages, result.info));
+  }
+);
+
+server.registerTool(
+  "gmail_message_get",
+  {
+    title: "Get message",
+    description:
+      "Fetch one message by UID with full body and attachment metadata. HTML-only messages are auto-converted to plain text.",
+    inputSchema: {
+      mailbox: z.string().min(1).optional(),
+      uid: z.number().int().min(1),
+    },
+  },
+  async (params: { mailbox?: string; uid: number }) => {
+    const { runtime } = await getRuntime();
+    const message = await runtime.getMessage(params);
+    return toolTextResult(formatMessage(message));
+  }
+);
+
+server.registerTool(
+  "gmail_thread_get",
+  {
+    title: "Get thread (Gmail)",
+    description:
+      "Fetch all messages in the same Gmail thread as the given UID, ordered chronologically. Requires Gmail (X-GM-EXT-1). All thread messages are fetched in a single IMAP round-trip.",
+    inputSchema: {
+      mailbox: z.string().min(1).optional(),
+      uid: z.number().int().min(1),
+    },
+  },
+  async (params: { mailbox?: string; uid: number }) => {
+    const { runtime } = await getRuntime();
+    const bundle = await runtime.getThread(params);
+    return toolTextResult(formatThread(bundle));
+  }
+);
+
+server.registerTool(
+  "gmail_message_attachments_save",
+  {
+    title: "Save attachments",
+    description:
+      "Download all (or filtered) attachments of one message to the configured attachments directory. Returns absolute paths the agent can read directly.",
+    inputSchema: {
+      mailbox: z.string().min(1).optional(),
+      uid: z.number().int().min(1),
+      filenames: z.array(z.string().min(1)).optional(),
+    },
+  },
+  async (params: { mailbox?: string; uid: number; filenames?: string[] }) => {
+    const { runtime } = await getRuntime();
+    const result = await runtime.downloadAttachments(params);
+    const lines = [
+      `mailbox: ${result.mailbox}`,
+      `uid: ${result.uid}`,
+      `directory: ${result.directory}`,
+      `saved: ${result.saved.length}`,
+      ...result.saved.map((a) => `  - ${a.filename} (${a.contentType ?? "?"}, ${a.size}B) -> ${a.path}`),
+    ];
+    if (result.skipped.length) {
+      lines.push(`skipped: ${result.skipped.length}`);
+      for (const s of result.skipped) lines.push(`  - ${s.filename}: ${s.reason}`);
+    }
+    return toolTextResult(lines.join("\n"));
+  }
+);
+
+server.registerTool(
+  "gmail_message_update",
+  {
+    title: "Update flags",
+    description: "Mark one message as read/unread and/or set/clear its starred state.",
+    inputSchema: {
+      mailbox: z.string().min(1).optional(),
+      uid: z.number().int().min(1),
+      read: z.boolean().optional(),
+      flagged: z.boolean().optional(),
+    },
+  },
+  async (params: { mailbox?: string; uid: number; read?: boolean; flagged?: boolean }) => {
+    if (typeof params.read !== "boolean" && typeof params.flagged !== "boolean") {
+      throw new Error("Provide at least one flag update: read and/or flagged.");
+    }
+    const { runtime } = await getRuntime();
+    const result = await runtime.updateMessage(params);
+    return toolTextResult(
+      `Updated ${result.mailbox} uid ${result.uid}${typeof result.read === "boolean" ? ` read=${result.read}` : ""}${typeof result.flagged === "boolean" ? ` flagged=${result.flagged}` : ""}`
+    );
+  }
+);
+
+server.registerTool(
+  "gmail_message_move",
+  {
+    title: "Move message",
+    description: "Move one message to another mailbox.",
+    inputSchema: {
+      mailbox: z.string().min(1).optional(),
+      uid: z.number().int().min(1),
+      destinationMailbox: z.string().min(1),
+    },
+  },
+  async (params: { mailbox?: string; uid: number; destinationMailbox: string }) => {
+    const { runtime } = await getRuntime();
+    const result = await runtime.moveMessage(params);
+    return toolTextResult(`Moved uid ${result.uid} from ${result.sourceMailbox} to ${result.destinationMailbox}`);
+  }
+);
+
+server.registerTool(
+  "gmail_message_send",
+  {
+    title: "Send message",
+    description: "Send a new email. With requireExplicitSendConfirmation=true (default), must pass confirm=true.",
+    inputSchema: {
+      to: recipientSchema,
+      cc: recipientSchema.optional(),
+      bcc: recipientSchema.optional(),
+      subject: z.string().min(1),
+      text: z.string().optional(),
+      html: z.string().optional(),
+      attachments: z.array(attachmentInputSchema).optional(),
+      confirm: z.boolean().optional(),
+    },
+  },
+  async (params: {
+    to: string | string[];
+    cc?: string | string[];
+    bcc?: string | string[];
+    subject: string;
+    text?: string;
+    html?: string;
+    attachments?: { path: string; filename?: string; contentType?: string }[];
+    confirm?: boolean;
+  }) => {
+    const { cfg, runtime } = await getRuntime();
+    if (cfg.requireExplicitSendConfirmation && params.confirm !== true) {
+      return toolTextResult(
+        "Refusing to send: requireExplicitSendConfirmation is enabled and confirm=true was not provided."
+      );
+    }
+    if (!params.text && !params.html) throw new Error("Provide text and/or html body");
+    const result = await runtime.sendMessage(params);
+    return toolTextResult(
+      `Sent. accepted=[${result.accepted.join(", ")}] rejected=[${result.rejected.join(", ")}] subject="${result.subject}"`
+    );
+  }
+);
+
+server.registerTool(
+  "gmail_message_reply",
+  {
+    title: "Reply to message",
+    description: "Reply to an existing message by UID. replyAll=true CCs all original recipients (excluding self).",
+    inputSchema: {
+      mailbox: z.string().min(1).optional(),
+      uid: z.number().int().min(1),
+      text: z.string().optional(),
+      html: z.string().optional(),
+      replyAll: z.boolean().optional(),
+      attachments: z.array(attachmentInputSchema).optional(),
+      confirm: z.boolean().optional(),
+    },
+  },
+  async (params: {
+    mailbox?: string;
+    uid: number;
+    text?: string;
+    html?: string;
+    replyAll?: boolean;
+    attachments?: { path: string; filename?: string; contentType?: string }[];
+    confirm?: boolean;
+  }) => {
+    const { cfg, runtime } = await getRuntime();
+    if (cfg.requireExplicitSendConfirmation && params.confirm !== true) {
+      return toolTextResult(
+        "Refusing to reply: requireExplicitSendConfirmation is enabled and confirm=true was not provided."
+      );
+    }
+    if (!params.text && !params.html) throw new Error("Provide text and/or html body");
+    const original = await runtime.getMessage(params);
+    const ownAddresses = uniqueStrings([lower(cfg.from), lower(cfg.username)]);
+    const replyTarget = original.replyTo || original.from;
+    const subject = /^re:/i.test(original.subject) ? original.subject : `Re: ${original.subject}`;
+    const messageIdRef = original.messageId
+      ? `<${String(original.messageId).replace(/^<|>$/g, "")}>`
+      : undefined;
+    const references = uniqueStrings([...(original.references ?? []), messageIdRef ?? ""].filter(Boolean));
+    let to: string[];
+    let cc: string[] = [];
+    if (params.replyAll) {
+      const all = uniqueStrings(
+        [replyTarget, original.to, original.cc].join(",").split(",").map((s) => s.trim()).filter(Boolean)
+      ).filter((addr) => !ownAddresses.includes(lower(addr)));
+      to = all.slice(0, 1);
+      cc = all.slice(1);
+    } else {
+      to = [replyTarget].filter(Boolean);
+    }
+    const quoted = original.bodyText
+      ? `\n\nOn ${original.date ?? ""}, ${original.from} wrote:\n${original.bodyText.split("\n").map((l) => `> ${l}`).join("\n")}`
+      : "";
+    const result = await runtime.sendMessage({
+      to,
+      cc,
+      subject,
+      text: params.text ? `${params.text}${quoted}` : undefined,
+      html: params.html,
+      inReplyTo: messageIdRef,
+      references,
+      attachments: params.attachments,
+    });
+    return toolTextResult(`Replied. accepted=[${result.accepted.join(", ")}] subject="${result.subject}"`);
+  }
+);
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("gmail-imap MCP server running on stdio");
+}
+
+main().catch((err) => {
+  console.error("gmail-imap fatal:", err);
+  process.exit(1);
 });
