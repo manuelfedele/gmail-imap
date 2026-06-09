@@ -1,6 +1,6 @@
 {
   "name": "gmail-imap",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Gmail (and any IMAP/SMTP mailbox) via App Passwords — server-side search, thread fetch, send/reply with confirmation guardrail, and attachment download to disk.",
   "author": {
     "name": "Manuel Fedele",

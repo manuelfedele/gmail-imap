@@ -69,6 +69,11 @@ const CONFIG_HELP = [
   "Generate a Gmail App Password at https://myaccount.google.com/apppasswords (requires 2FA).",
 ].join("\n");
 
+/** Treat empty strings as unset so blank `${VAR}` expansions don't shadow the config file. */
+function envStr(value: string | undefined): string | undefined {
+  return value === undefined || value.trim() === "" ? undefined : value;
+}
+
 function envBool(value: string | undefined): boolean | undefined {
   if (value === undefined || value === "") return undefined;
   return !/^(?:0|false|no|off)$/i.test(value);
@@ -93,24 +98,24 @@ async function loadRawConfig(): Promise<RawConfig> {
   const env = process.env;
   return {
     ...fileConfig,
-    username: env.GMAIL_USERNAME ?? fileConfig.username,
-    appPassword: env.GMAIL_APP_PASSWORD ?? fileConfig.appPassword,
-    from: env.GMAIL_FROM ?? fileConfig.from,
-    fromName: env.GMAIL_FROM_NAME ?? fileConfig.fromName,
-    replyTo: env.GMAIL_REPLY_TO ?? fileConfig.replyTo,
+    username: envStr(env.GMAIL_USERNAME) ?? fileConfig.username,
+    appPassword: envStr(env.GMAIL_APP_PASSWORD) ?? fileConfig.appPassword,
+    from: envStr(env.GMAIL_FROM) ?? fileConfig.from,
+    fromName: envStr(env.GMAIL_FROM_NAME) ?? fileConfig.fromName,
+    replyTo: envStr(env.GMAIL_REPLY_TO) ?? fileConfig.replyTo,
     imap: {
-      host: env.GMAIL_IMAP_HOST ?? fileConfig.imap?.host,
+      host: envStr(env.GMAIL_IMAP_HOST) ?? fileConfig.imap?.host,
       port: envInt(env.GMAIL_IMAP_PORT) ?? fileConfig.imap?.port,
       secure: envBool(env.GMAIL_IMAP_SECURE) ?? fileConfig.imap?.secure,
     },
     smtp: {
-      host: env.GMAIL_SMTP_HOST ?? fileConfig.smtp?.host,
+      host: envStr(env.GMAIL_SMTP_HOST) ?? fileConfig.smtp?.host,
       port: envInt(env.GMAIL_SMTP_PORT) ?? fileConfig.smtp?.port,
       secure: envBool(env.GMAIL_SMTP_SECURE) ?? fileConfig.smtp?.secure,
     },
-    defaultMailbox: env.GMAIL_DEFAULT_MAILBOX ?? fileConfig.defaultMailbox,
+    defaultMailbox: envStr(env.GMAIL_DEFAULT_MAILBOX) ?? fileConfig.defaultMailbox,
     defaultSearchLimit: envInt(env.GMAIL_DEFAULT_SEARCH_LIMIT) ?? fileConfig.defaultSearchLimit,
-    attachmentsDir: env.GMAIL_ATTACHMENTS_DIR ?? fileConfig.attachmentsDir,
+    attachmentsDir: envStr(env.GMAIL_ATTACHMENTS_DIR) ?? fileConfig.attachmentsDir,
     requireExplicitSendConfirmation:
       envBool(env.GMAIL_REQUIRE_SEND_CONFIRMATION) ?? fileConfig.requireExplicitSendConfirmation,
   };
@@ -785,7 +790,7 @@ function createRuntime(cfg: NormalizedConfig) {
       );
     },
 
-    async downloadAttachments(params: { mailbox?: string; uid: number; filenames?: string[] }) {
+    async downloadAttachments(params: { mailbox?: string; uid: number; filenames?: string[]; subdir?: string }) {
       const mailbox = params.mailbox?.trim() || cfg.defaultMailbox;
       const filterSet = params.filenames?.length ? new Set(params.filenames.map(String)) : null;
       return withImapClient(cfg, (client) =>
@@ -798,7 +803,10 @@ function createRuntime(cfg: NormalizedConfig) {
           if (!item) throw new Error(`Message uid ${params.uid} not found`);
           const parsed: ParsedMail = await simpleParser(await readSourceText(item.source));
           const safeMailbox = sanitizeFsName(mailbox, "INBOX");
-          const targetDir = join(cfg.attachmentsDir, `${safeMailbox}-${params.uid}`);
+          const baseDir = params.subdir
+            ? join(cfg.attachmentsDir, sanitizeFsName(params.subdir, "misc"))
+            : cfg.attachmentsDir;
+          const targetDir = join(baseDir, `${safeMailbox}-${params.uid}`);
           await mkdir(targetDir, { recursive: true });
           const saved: { filename: string; path: string; contentType?: string; size: number }[] = [];
           const skipped: { filename: string; reason: string }[] = [];
@@ -1017,7 +1025,7 @@ const attachmentInputSchema = z.object({
   contentType: z.string().min(1).optional(),
 });
 
-const server = new McpServer({ name: "gmail-imap", version: "1.0.0" });
+const server = new McpServer({ name: "gmail-imap", version: "1.1.0" });
 
 server.registerTool(
   "gmail_mailboxes_list",
@@ -1106,14 +1114,15 @@ server.registerTool(
   {
     title: "Save attachments",
     description:
-      "Download all (or filtered) attachments of one message to the configured attachments directory. Returns absolute paths the agent can read directly.",
+      "Download all (or filtered) attachments of one message to the configured attachments directory. Returns absolute paths the agent can read directly. Optional `subdir` nests the per-message folder under a subdirectory of the attachments dir (e.g. a year like \"2026\").",
     inputSchema: {
       mailbox: z.string().min(1).optional(),
       uid: z.number().int().min(1),
       filenames: z.array(z.string().min(1)).optional(),
+      subdir: z.string().min(1).optional(),
     },
   },
-  async (params: { mailbox?: string; uid: number; filenames?: string[] }) => {
+  async (params: { mailbox?: string; uid: number; filenames?: string[]; subdir?: string }) => {
     const { runtime } = await getRuntime();
     const result = await runtime.downloadAttachments(params);
     const lines = [

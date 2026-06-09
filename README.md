@@ -151,10 +151,10 @@ Combined with Claude's own tool-approval prompts, this gives you a two-step path
 ## Where attachments are saved
 
 ```
-<attachmentsDir>/<mailbox>-<uid>/<filename>
+<attachmentsDir>/[<subdir>/]<mailbox>-<uid>/<filename>
 ```
 
-Default: `~/.gmail-imap/attachments/INBOX-12345/invoice.pdf`
+Default: `~/.gmail-imap/attachments/INBOX-12345/invoice.pdf`. Pass the optional `subdir` tool parameter to nest the per-message folder (e.g. `subdir: "2026"` for year-based archiving).
 
 Filenames are sanitized (`/`, `\`, leading dots, NUL stripped); collisions inside the same message overwrite; re-downloads of the same UID reuse the directory. The tool result includes the absolute path of every saved file.
 
@@ -246,6 +246,11 @@ printf '%s\n%s\n%s\n' \
 ---
 
 ## Changelog
+
+### 1.1.0
+
+- `gmail_message_attachments_save` accepts an optional `subdir` parameter to nest saves under a subdirectory of the attachments dir (e.g. a year).
+- `.mcp.json` passes `GMAIL_USERNAME`, `GMAIL_APP_PASSWORD`, and `GMAIL_ATTACHMENTS_DIR` through explicitly; empty env values no longer shadow the config file.
 
 ### 1.0.0
 

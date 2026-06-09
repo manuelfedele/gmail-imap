@@ -94107,6 +94107,9 @@ var CONFIG_HELP = [
   "",
   "Generate a Gmail App Password at https://myaccount.google.com/apppasswords (requires 2FA)."
 ].join("\n");
+function envStr(value) {
+  return value === void 0 || value.trim() === "" ? void 0 : value;
+}
 function envBool(value) {
   if (value === void 0 || value === "") return void 0;
   return !/^(?:0|false|no|off)$/i.test(value);
@@ -94128,24 +94131,24 @@ async function loadRawConfig() {
   const env = process.env;
   return {
     ...fileConfig,
-    username: env.GMAIL_USERNAME ?? fileConfig.username,
-    appPassword: env.GMAIL_APP_PASSWORD ?? fileConfig.appPassword,
-    from: env.GMAIL_FROM ?? fileConfig.from,
-    fromName: env.GMAIL_FROM_NAME ?? fileConfig.fromName,
-    replyTo: env.GMAIL_REPLY_TO ?? fileConfig.replyTo,
+    username: envStr(env.GMAIL_USERNAME) ?? fileConfig.username,
+    appPassword: envStr(env.GMAIL_APP_PASSWORD) ?? fileConfig.appPassword,
+    from: envStr(env.GMAIL_FROM) ?? fileConfig.from,
+    fromName: envStr(env.GMAIL_FROM_NAME) ?? fileConfig.fromName,
+    replyTo: envStr(env.GMAIL_REPLY_TO) ?? fileConfig.replyTo,
     imap: {
-      host: env.GMAIL_IMAP_HOST ?? fileConfig.imap?.host,
+      host: envStr(env.GMAIL_IMAP_HOST) ?? fileConfig.imap?.host,
       port: envInt(env.GMAIL_IMAP_PORT) ?? fileConfig.imap?.port,
       secure: envBool(env.GMAIL_IMAP_SECURE) ?? fileConfig.imap?.secure
     },
     smtp: {
-      host: env.GMAIL_SMTP_HOST ?? fileConfig.smtp?.host,
+      host: envStr(env.GMAIL_SMTP_HOST) ?? fileConfig.smtp?.host,
       port: envInt(env.GMAIL_SMTP_PORT) ?? fileConfig.smtp?.port,
       secure: envBool(env.GMAIL_SMTP_SECURE) ?? fileConfig.smtp?.secure
     },
-    defaultMailbox: env.GMAIL_DEFAULT_MAILBOX ?? fileConfig.defaultMailbox,
+    defaultMailbox: envStr(env.GMAIL_DEFAULT_MAILBOX) ?? fileConfig.defaultMailbox,
     defaultSearchLimit: envInt(env.GMAIL_DEFAULT_SEARCH_LIMIT) ?? fileConfig.defaultSearchLimit,
-    attachmentsDir: env.GMAIL_ATTACHMENTS_DIR ?? fileConfig.attachmentsDir,
+    attachmentsDir: envStr(env.GMAIL_ATTACHMENTS_DIR) ?? fileConfig.attachmentsDir,
     requireExplicitSendConfirmation: envBool(env.GMAIL_REQUIRE_SEND_CONFIRMATION) ?? fileConfig.requireExplicitSendConfirmation
   };
 }
@@ -94704,7 +94707,8 @@ function createRuntime(cfg) {
           if (!item) throw new Error(`Message uid ${params.uid} not found`);
           const parsed = await (0, import_mailparser.simpleParser)(await readSourceText(item.source));
           const safeMailbox = sanitizeFsName(mailbox, "INBOX");
-          const targetDir = (0, import_node_path.join)(cfg.attachmentsDir, `${safeMailbox}-${params.uid}`);
+          const baseDir = params.subdir ? (0, import_node_path.join)(cfg.attachmentsDir, sanitizeFsName(params.subdir, "misc")) : cfg.attachmentsDir;
+          const targetDir = (0, import_node_path.join)(baseDir, `${safeMailbox}-${params.uid}`);
           await (0, import_promises.mkdir)(targetDir, { recursive: true });
           const saved = [];
           const skipped = [];
@@ -94883,7 +94887,7 @@ var attachmentInputSchema = external_exports.object({
   filename: external_exports.string().min(1).optional(),
   contentType: external_exports.string().min(1).optional()
 });
-var server = new McpServer({ name: "gmail-imap", version: "1.0.0" });
+var server = new McpServer({ name: "gmail-imap", version: "1.1.0" });
 server.registerTool(
   "gmail_mailboxes_list",
   {
@@ -94959,11 +94963,12 @@ server.registerTool(
   "gmail_message_attachments_save",
   {
     title: "Save attachments",
-    description: "Download all (or filtered) attachments of one message to the configured attachments directory. Returns absolute paths the agent can read directly.",
+    description: 'Download all (or filtered) attachments of one message to the configured attachments directory. Returns absolute paths the agent can read directly. Optional `subdir` nests the per-message folder under a subdirectory of the attachments dir (e.g. a year like "2026").',
     inputSchema: {
       mailbox: external_exports.string().min(1).optional(),
       uid: external_exports.number().int().min(1),
-      filenames: external_exports.array(external_exports.string().min(1)).optional()
+      filenames: external_exports.array(external_exports.string().min(1)).optional(),
+      subdir: external_exports.string().min(1).optional()
     }
   },
   async (params) => {

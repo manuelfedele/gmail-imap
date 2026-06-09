@@ -2,7 +2,12 @@
   "mcpServers": {
     "gmail-imap": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/index.cjs"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/index.cjs"],
+      "env": {
+        "GMAIL_USERNAME": "${GMAIL_USERNAME}",
+        "GMAIL_APP_PASSWORD": "${GMAIL_APP_PASSWORD}",
+        "GMAIL_ATTACHMENTS_DIR": "${GMAIL_ATTACHMENTS_DIR}"
+      }
     }
   }
 }

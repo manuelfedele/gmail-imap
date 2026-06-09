@@ -54,11 +54,12 @@ or scripts. Typical flow:
 
 1. `gmail_messages_search` with `has:attachment` to find the message.
 2. `gmail_message_attachments_save` with its `uid` (optionally `filenames` to
-   pick specific files).
+   pick specific files, and `subdir` to nest under a subdirectory such as a
+   year: `subdir: "2026"`).
 3. Read/process the returned paths.
 
-Files land under `<attachmentsDir>/<mailbox>-<uid>/` and re-downloads of the
-same UID reuse that directory.
+Files land under `<attachmentsDir>/[<subdir>/]<mailbox>-<uid>/` and
+re-downloads of the same UID reuse that directory.
 
 ## Sending and replying — confirmation guardrail
 
