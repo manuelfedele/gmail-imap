@@ -1,0 +1,14 @@
+{
+  "name": "gmail-imap",
+  "owner": {
+    "name": "Manuel Fedele",
+    "email": "manuelfedele@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "gmail-imap",
+      "source": "./",
+      "description": "Gmail (and any IMAP/SMTP mailbox) via App Passwords — server-side search, thread fetch, send/reply with confirmation guardrail, and attachment download to disk."
+    }
+  ]
+}
