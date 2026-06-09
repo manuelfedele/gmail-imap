@@ -1,6 +1,6 @@
 {
   "name": "gmail-imap",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Claude plugin: Gmail (and any IMAP/SMTP mailbox) via App Passwords. Server-side IMAP search with Gmail X-GM-RAW, thread fetch, HTML→text fallback, send/reply with confirmation guardrail, and attachment download to disk.",
   "type": "module",
   "private": true,

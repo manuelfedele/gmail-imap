@@ -1,8 +1,11 @@
 {
   "mcpServers": {
     "gmail-imap": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/index.cjs"],
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin\"; exec node \"${CLAUDE_PLUGIN_ROOT}/dist/index.cjs\""
+      ],
       "env": {
         "GMAIL_USERNAME": "${GMAIL_USERNAME}",
         "GMAIL_APP_PASSWORD": "${GMAIL_APP_PASSWORD}",

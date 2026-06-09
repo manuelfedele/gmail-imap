@@ -1025,7 +1025,7 @@ const attachmentInputSchema = z.object({
   contentType: z.string().min(1).optional(),
 });
 
-const server = new McpServer({ name: "gmail-imap", version: "1.1.0" });
+const server = new McpServer({ name: "gmail-imap", version: "1.1.1" });
 
 server.registerTool(
   "gmail_mailboxes_list",

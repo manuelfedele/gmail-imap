@@ -94887,7 +94887,7 @@ var attachmentInputSchema = external_exports.object({
   filename: external_exports.string().min(1).optional(),
   contentType: external_exports.string().min(1).optional()
 });
-var server = new McpServer({ name: "gmail-imap", version: "1.1.0" });
+var server = new McpServer({ name: "gmail-imap", version: "1.1.1" });
 server.registerTool(
   "gmail_mailboxes_list",
   {
