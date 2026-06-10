@@ -1,4 +1,6 @@
-node_modules/
+/gmail-imap
+/gmail-imap.exe
+/dist/
 *.log
 .env
 .env.*
