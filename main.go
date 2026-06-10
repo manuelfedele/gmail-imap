@@ -51,9 +51,9 @@ type searchArgs struct {
 	From          string `json:"from,omitempty" jsonschema:"Match sender"`
 	To            string `json:"to,omitempty" jsonschema:"Match recipient"`
 	Subject       string `json:"subject,omitempty" jsonschema:"Match subject"`
-	Unread        *bool  `json:"unread,omitempty" jsonschema:"Only unread (true) or only read (false) messages"`
-	Flagged       *bool  `json:"flagged,omitempty" jsonschema:"Only starred (true) or only unstarred (false) messages"`
-	HasAttachment *bool  `json:"hasAttachment,omitempty" jsonschema:"Only messages with (true) or without (false) attachments"`
+	Unread        *bool  `json:"unread,omitempty" jsonschema:"JSON boolean: true = only unread, false = only read. Do NOT pass as string."`
+	Flagged       *bool  `json:"flagged,omitempty" jsonschema:"JSON boolean: true = only starred, false = only unstarred. Do NOT pass as string."`
+	HasAttachment *bool  `json:"hasAttachment,omitempty" jsonschema:"JSON boolean: true = only with attachments, false = only without. Do NOT pass as string."`
 	Since         string `json:"since,omitempty" jsonschema:"Lower bound on date (ISO or YYYY-MM-DD)"`
 	Before        string `json:"before,omitempty" jsonschema:"Upper bound on date (ISO or YYYY-MM-DD). Use as pagination cursor."`
 	Limit         int    `json:"limit,omitempty" jsonschema:"Max results (1-100, default 10)"`
@@ -85,9 +85,9 @@ type moveArgs struct {
 }
 
 type sendArgs struct {
-	To          []string          `json:"to" jsonschema:"Recipient addresses"`
-	Cc          []string          `json:"cc,omitempty" jsonschema:"CC addresses"`
-	Bcc         []string          `json:"bcc,omitempty" jsonschema:"BCC addresses"`
+	To          string            `json:"to" jsonschema:"Recipient address, or multiple addresses separated by commas"`
+	Cc          string            `json:"cc,omitempty" jsonschema:"CC address(es), comma-separated"`
+	Bcc         string            `json:"bcc,omitempty" jsonschema:"BCC address(es), comma-separated"`
 	Subject     string            `json:"subject" jsonschema:"Subject line"`
 	Text        string            `json:"text,omitempty" jsonschema:"Plain-text body"`
 	HTML        string            `json:"html,omitempty" jsonschema:"HTML body"`
@@ -303,14 +303,14 @@ func main() {
 		if args.Text == "" && args.HTML == "" {
 			return nil, nil, errors.New("provide text and/or html body")
 		}
-		to := splitRecipients(args.To)
+		to := splitRecipients([]string{args.To})
 		if len(to) == 0 {
 			return nil, nil, errors.New("provide at least one recipient")
 		}
 		err = sendMessage(ctx, cfg, outgoingMessage{
 			To:          to,
-			Cc:          splitRecipients(args.Cc),
-			Bcc:         splitRecipients(args.Bcc),
+			Cc:          splitRecipients([]string{args.Cc}),
+			Bcc:         splitRecipients([]string{args.Bcc}),
 			Subject:     args.Subject,
 			Text:        args.Text,
 			HTML:        args.HTML,
